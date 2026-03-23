@@ -67,35 +67,32 @@ def get_args():
 
 def main():
     args = dict(
-        # --- Paths ---
+        # Paths
         model='yolov10s.pt',      # Student checkpoint
-        data='my_data.yaml',       # File yaml dataset (train/test/nc/names)
+        data='data.yaml',         # File yaml dataset (train/test/nc/names)
         project='diffkd-irformer-yolo',
         name='run1',
         
-        # --- Hyperparameters ---
+        # Hyperparameters
         epochs=100,
         imgsz=640,
-        batch=16,
-        device=0,                 # Index của GPU
-        lr0=0.01,                 # Ultralytics dùng lr0 thay vì lr
+        batch=32,
+        device=0,
+        lr0=0.01,
         weight_decay=0.0005,
         warmup_epochs=3.0,
         
-        # --- KD Specific (Sẽ được truyền vào YOLOV10KDTrainer) ---
-        teacher_ckpt='weights/irformer_pretrained.pt', # Path tới IRFormer
+        # KD Specific (Sẽ được truyền vào YOLOV10KDTrainer)
+        teacher_ckpt='/kaggle/input/datasets/datnguyen16/irformer-checkpoint/teacher.pth', # Path tới IRFormer
         kd_loss_weight=0.5,
         
-        # --- Logging ---
-        plots=True,               # Vẽ biểu đồ kết quả
+        # Logging 
+        plots=True,        
         save=True,
     )
 
-    # Khởi tạo trainer custom
     trainer = YOLOV10KDTrainer(overrides=args)
-    
-    # Bắt đầu huấn luyện
-    # Ultralytics tự động gọi train_one_epoch, validate, save_checkpoint bên trong
+
     trainer.train()
 
 if __name__ == '__main__':

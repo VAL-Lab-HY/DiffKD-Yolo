@@ -132,46 +132,42 @@ class KDLoss():
         teacher.eval()
         self._iter = 0
 
-    def __call__(self, x, targets):
-        # FIX: Resize input cho Teacher về 256x256 (Pretrained chuẩn)
+    def __call__(self, x, batch):  # batch là dict đầy đủ
         with torch.no_grad():
             x_teacher = F.interpolate(x, size=(256, 256), mode='bilinear', align_corners=False)
             _ = self.teacher(x_teacher)
 
         logits = self.student(x)
-        ori_loss = self.ori_loss(logits, targets)
+        
+        # ori_loss là v8DetectionLoss — cần (preds, batch_dict)
+        ori_loss, loss_items = self.ori_loss(logits, batch)
 
         kd_loss = 0
         for tm, sm in zip(self.teacher_modules, self.student_modules):
             m_key = tm.replace('.', '_') if tm != '' else 'logits'
-
             s_feat = self._reshape_BCHW(self._student_out[sm])
             t_feat = self._reshape_BCHW(self._teacher_out[tm])
 
-            # FIX: Resize teacher feature (256x256) về size của student feature (320x320)
             if s_feat.shape[-2:] != t_feat.shape[-2:]:
                 t_feat = F.interpolate(t_feat, size=s_feat.shape[-2:], mode='bilinear', align_corners=False)
 
             if self.kd_method == 'diffkd':
-                # Pass qua module DiffKD
                 s_feat_refined, t_feat_target, diff_loss, ae_loss = self.diff[m_key](s_feat, t_feat)
-                
-                # Tính MSE loss giữa đặc trưng đã tinh lọc và teacher
                 kd_loss_item = self.kd_loss[m_key](s_feat_refined, t_feat_target)
-                
                 current_step_loss = kd_loss_item + diff_loss
                 if ae_loss is not None:
                     current_step_loss += ae_loss
-                
                 kd_loss += current_step_loss
-                
+
                 if self._iter % 50 == 0:
                     logger.info(f'[{tm}] KD: {kd_loss_item.item():.4f} | Diff: {diff_loss.item():.4f}')
-            
+
         self._teacher_out = {}
         self._student_out = {}
         self._iter += 1
-        return ori_loss * self.ori_loss_weight + kd_loss * self.kd_loss_weight
+        
+        total = ori_loss * self.ori_loss_weight + kd_loss * self.kd_loss_weight
+        return total, loss_items 
 
     def _register_forward_hook(self, model, name, teacher=False):
         if name == '':

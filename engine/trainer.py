@@ -7,8 +7,17 @@ from ultralytics.utils.loss import v8DetectionLoss
 from models.losses.kd_loss import KDLoss 
 
 
+class DiffKDTrainer():
+    pass
+
+
 class YOLOV10KDTrainer(DetectionTrainer):
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
+        
+        # Tách custom args ra
+        self.teacher_ckpt = overrides.pop("teacher_ckpt", None)
+        self.kd_loss_weight = overrides.pop("kd_loss_weight", 1.0)
+
         super().__init__(cfg, overrides, _callbacks)
         # Khởi tạo Teacher và DiffKD ở đây hoặc trong get_model
         self.teacher = None
@@ -20,11 +29,17 @@ class YOLOV10KDTrainer(DetectionTrainer):
         
         # 1. Khởi tạo Teacher (IRFormer)
         # Giả sử bạn truyền path teacher qua overrides hoặc lấy từ args
-        teacher_ckpt = self.args.teacher_ckpt if hasattr(self.args, 'teacher_ckpt') else 'irformer.pt'
+        teacher_ckpt = self.teacher_ckpt
         
         from models.irformer import Model as IRFormer
         self.teacher = IRFormer(in_nc=3, out_nc=3, base_nf=16).to(self.device)
-        self.teacher.load_state_dict(torch.load(teacher_ckpt, map_location=self.device))
+        ckpt = torch.load(teacher_ckpt, map_location=self.device)
+        if 'state_dict' in ckpt:
+            state_dict = ckpt['state_dict']
+        else:
+            state_dict = ckpt
+
+        self.teacher.load_state_dict(state_dict, strict=False)        
         self.teacher.eval()
         for p in self.teacher.parameters():
             p.requires_grad = False
@@ -38,32 +53,15 @@ class YOLOV10KDTrainer(DetectionTrainer):
             teacher_name='irformer',
             ori_loss=None, # Sẽ gán trong phương thức criterion
             kd_method='diffkd',
-            kd_loss_weight=self.args.kd_loss_weight,
+            kd_loss_weight=self.kd_loss_weight,
             kd_loss_kwargs={'ae_channels': 16, 'use_ae': True}
         )
         return model
 
-    def preprocess_batch(self, batch):
-        """Xử lý batch trước khi đưa vào mô hình"""
-        batch = super().preprocess_batch(batch)
-        # Tạo thêm ảnh 256 cho Teacher
-        batch['img_teacher'] = F.interpolate(batch['img'], size=(256, 256), 
-                                            mode='bilinear', align_corners=False)
-        return batch
-
     def criterion(self, preds, batch):
-        """Ghi đè hàm tính Loss để chèn KD"""
         if self.kd_loss_fn.ori_loss is None:
-            # Khởi tạo loss gốc của YOLO nếu chưa có
             self.kd_loss_fn.ori_loss = v8DetectionLoss(self.model)
 
-        # Chạy Teacher forward bằng ảnh đã resize trong preprocess_batch
-        with torch.no_grad():
-            _ = self.teacher(batch['img_teacher'])
+        total_loss, loss_items = self.kd_loss_fn(batch['img'], batch)
 
-        # Tính toán tổng Loss (YOLO + DiffKD) qua class KDLoss đã viết
-        # KDLoss sẽ lấy đặc trưng qua Hook đã đăng ký trong __init__ của nó
-        total_loss = self.kd_loss_fn(batch['img'], batch['cls']) # batch['cls'] tùy thuộc vào dataset format
-        
-        # Ultralytics yêu cầu return về (loss_sum, loss_items_tensor)
-        return total_loss, torch.zeros(3, device=self.device)
+        return total_loss, loss_items 

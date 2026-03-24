@@ -12,8 +12,8 @@ logger = logging.getLogger()
 
 KD_MODULES = {
     'irformer': dict(modules=['transformer.2'], channels=[16]),
-    'yolov10s': dict(modules=['model.4'], channels=[64]),
-    'yolov12s': dict(modules=['model.4'], channels=[64]),
+    'yolov10s': dict(modules=['model.4'], channels=[128]),
+    'yolov12s': dict(modules=['model.4'], channels=[128]),
 }
 
 
@@ -175,14 +175,14 @@ class KDLoss():
             module.register_forward_hook(partial(self._forward_hook, name=name, teacher=teacher))
 
     def _forward_hook(self, module, input, output, name, teacher=False):
-        # FIX 3: dùng isinstance thay vì len(output) == 1
-        # tensor có len() = batch size, không phải số phần tử output
+        # Nếu là tuple/list lấy phần tử đầu tiên là feature map.
         if isinstance(output, (tuple, list)):
             out = output[0]
         else:
             out = output
+            
         if teacher:
-            self._teacher_out[name] = out
+            self._teacher_out[name] = out.detach() # Detach teacher để nhẹ memory
         else:
             self._student_out[name] = out
 
@@ -202,16 +202,12 @@ class KDLoss():
     def __call__(self, preds, batch):
         with torch.no_grad():
             _ = self.teacher(batch['img'])
-
-        if isinstance(preds, (tuple, list)) and not isinstance(preds[0], torch.Tensor):
-            preds = preds[0]
-
-        # detection loss
+        
+        # Tính detection loss
         det_loss, loss_items = self.ori_loss(preds, batch)
 
-        # KD loss
+        # KD loss (DiffKD)
         kd_loss = self.compute_kd_loss()
-        print("KD LOSS:", kd_loss.item())
 
         total_loss = self.ori_loss_weight * det_loss + self.kd_loss_weight * kd_loss
 

@@ -415,7 +415,7 @@ class BaseTrainer:
         # ------------------------------------------------------------------
         if self.teacher_path is not None and self.kd_loss_fn is None:
             from models.losses.kd_loss import KDLoss
-            from ultralytics.utils.loss import v8DetectionLoss
+            from ultralytics.utils.loss import E2EDetectLoss
 
             # 1. Load teacher từ checkpoint
             LOGGER.info(f"{colorstr('KD:')} loading teacher from '{self.teacher_path}'")
@@ -449,13 +449,17 @@ class BaseTrainer:
                 f"method= DiffKD | weight={self.kd_loss_weight}"
             )
 
-            # 2. Khởi tạo KDLoss — ori_loss là v8DetectionLoss của student
+            # 2. Khởi tạo KDLoss
+            student_model = unwrap_model(self.model)
+
+            ori_loss = getattr(student_model, 'criterion', E2EDetectLoss(student_model))
+
             self.kd_loss_fn = KDLoss(
-                student=unwrap_model(self.model),
+                student=student_model,
                 teacher=self.teacher,
                 student_name=self.student_name,
                 teacher_name=self.teacher_name,
-                ori_loss=v8DetectionLoss(unwrap_model(self.model)),
+                ori_loss=ori_loss,
                 kd_loss_weight=self.kd_loss_weight,
                 kd_loss_kwargs=self.kd_loss_kwargs,
             )

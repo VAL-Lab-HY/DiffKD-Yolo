@@ -29,7 +29,6 @@ def get_args():
     # KD
     parser.add_argument("--teacher-name", type=str,   default="irformer")
     parser.add_argument("--student-name", type=str,   default="yolov10s")
-    parser.add_argument("--kd-method", type=str,   default="diffkd")
     parser.add_argument("--kd-loss-weight", type=float, default=0.5)
     parser.add_argument("--ae-channels", type=int,   default=16)
     parser.add_argument("--kd-tau", type=float, default=1.0)
@@ -70,7 +69,6 @@ def build_overrides(args) -> dict:
         "teacher":        args.teacher,           # str path → BaseTrainer load
         "teacher_name":   args.teacher_name,      # key trong KD_MODULES
         "student_name":   args.student_name,      # key trong KD_MODULES
-        "kd_method":      args.kd_method,
         "kd_loss_weight": args.kd_loss_weight,
         "kd_loss_kwargs": {
             "ae_channels": args.ae_channels,

@@ -141,9 +141,6 @@ class KDLoss():
             s_feat = self._reshape_BCHW(self._student_out[sm])
             t_feat = self._reshape_BCHW(self._teacher_out[tm])
 
-            s_feat = F.normalize(s_feat, dim=1)
-            t_feat = F.normalize(t_feat, dim=1)
-
             if s_feat.shape[-2:] != t_feat.shape[-2:]:
                 t_feat = F.interpolate(t_feat, size=s_feat.shape[-2:], mode='bilinear', align_corners=False)
 

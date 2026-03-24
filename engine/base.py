@@ -452,7 +452,7 @@ class BaseTrainer:
             # 2. Khởi tạo KDLoss
             student_model = unwrap_model(self.model)
 
-            ori_loss = getattr(student_model, 'criterion', E2EDetectLoss(student_model))
+            ori_loss = E2EDetectLoss(student_model)
 
             self.kd_loss_fn = KDLoss(
                 student=student_model,
@@ -463,6 +463,8 @@ class BaseTrainer:
                 kd_loss_weight=self.kd_loss_weight,
                 kd_loss_kwargs=self.kd_loss_kwargs,
             )
+            
+            student_model.criterion = ori_loss
         # ------------------------------------------------------------------
 
         epoch = self.start_epoch

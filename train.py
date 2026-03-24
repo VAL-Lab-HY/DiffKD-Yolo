@@ -14,7 +14,7 @@ def main():
     logger.info("KD Training  |  IRFormer → YOLOv10s")
     logger.info(f"Teacher  : {args.teacher}")
     logger.info(f"Student  : {args.model}")
-    logger.info(f"KD weight: {args.kd_loss_weight}  |  method: {args.kd_method}")
+    logger.info(f"KD weight: {args.kd_loss_weight}")
     logger.info("=" * 60)
 
     trainer = DetectionTrainer(overrides=overrides)

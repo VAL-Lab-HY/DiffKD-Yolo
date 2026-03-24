@@ -509,11 +509,7 @@ class BaseTrainer:
                     with autocast(self.amp):
                         batch = self.preprocess_batch(batch)
                         if self.kd_loss_fn is not None:
-                            # KD mode: KDLoss tự gọi teacher forward + ori_loss + kd_loss
-                            if self.args.compile:
-                                preds = self.model(batch["img"])
-                            else:
-                                preds = self.model(batch)
+                            preds = unwrap_model(self.model)(batch["img"])   # ✅ raw predictions
                             loss, self.loss_items = self.kd_loss_fn(preds, batch)
                         elif self.args.compile:
                             # Standard mode (compile)

@@ -203,6 +203,9 @@ class KDLoss():
         with torch.no_grad():
             _ = self.teacher(batch['img'])
 
+        if isinstance(preds, (tuple, list)) and not isinstance(preds[0], torch.Tensor):
+            preds = preds[0]
+
         # detection loss
         det_loss, loss_items = self.ori_loss(preds, batch)
 

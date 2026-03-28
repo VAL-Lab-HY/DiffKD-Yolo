@@ -13,6 +13,7 @@ logger = logging.getLogger()
 KD_MODULES = {
     'irformer': dict(modules=['transformer.2'], channels=[16]),
     'yolov10s': dict(modules=['model.4'], channels=[128]),
+    'yolov10x': dict(modules=['model.4'], channels=[320]),
     'yolov12s': dict(modules=['model.4'], channels=[128]),
 }
 

@@ -15,6 +15,9 @@ import numpy as np
 import torch
 from torch import distributed as dist
 from torch import nn, optim
+import torch.nn.functional as F
+
+from models.diffkd import KLDivergence, DiffKD
 
 from ultralytics import __version__
 from ultralytics.cfg import get_cfg, get_save_dir
@@ -54,6 +57,349 @@ from ultralytics.utils.torch_utils import (
     unset_deterministic,
     unwrap_model,
 )
+
+
+class FeatureLoss(nn.Module):
+    def __init__(
+        self,
+        channels_s,
+        channels_t,
+        loss_weight=1.0,
+        device=None,
+        layer_weights=None,
+        ae_weight=0.3,
+    ):
+        super().__init__()
+
+        self.loss_weight = loss_weight
+        self.ae_weight = ae_weight
+
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = torch.device(device)
+
+        # layer weights (deep layer > shallow)
+        if layer_weights is None:
+            n = len(channels_s)
+            self.layer_weights = [0.5 + 1.5 * i / max(n - 1, 1) for i in range(n)]
+        else:
+            self.layer_weights = layer_weights
+
+        # DiffKD per layer
+        self.diffkd = nn.ModuleList([
+            DiffKD(
+                s, t,
+                kernel_size=3,
+                use_ae=True,
+                ae_channels=64
+            ).to(device)
+            for s, t in zip(channels_s, channels_t)
+        ])
+
+        # channel align
+        self.align = nn.ModuleList([
+            nn.Conv2d(s, t, 1).to(device)
+            for s, t in zip(channels_s, channels_t)
+        ])
+
+    def forward(self, y_s, y_t):
+
+        if len(y_s) != len(y_t):
+            y_t = y_t[-len(y_s):]
+
+        total_loss = 0.0
+
+        for i, (s, t) in enumerate(zip(y_s, y_t)):
+            s = self.align[i](s)
+
+            s, t, diff_loss, ae_loss = self.diffkd[i](s, t.detach())
+
+            loss = diff_loss
+            if ae_loss is not None:
+                loss += self.ae_weight * ae_loss
+
+            total_loss += loss * self.layer_weights[i]
+
+        return self.loss_weight * total_loss / sum(self.layer_weights)
+
+class LogitDistillationLoss(nn.Module):
+    def __init__(self, nc=2, reg_max=16, T=4.0):
+        super().__init__()
+        self.nc = nc
+        self.reg_max = reg_max
+        self.T = T
+        self.box_split = 4 * reg_max
+
+    def forward(self, s_preds, t_preds):
+
+        total = 0.0
+
+        for s, t in zip(s_preds, t_preds):
+
+            if s.shape[1] == self.box_split + self.nc:
+                s = s.permute(0, 2, 1)
+                t = t.permute(0, 2, 1)
+
+            s_cls = s[..., self.box_split:]
+            t_cls = t[..., self.box_split:].detach()
+
+            s_dfl = s[..., :self.box_split]
+            t_dfl = t[..., :self.box_split].detach()
+
+            # CLS KD
+            loss_cls = F.kl_div(
+                F.log_softmax(s_cls / self.T, dim=-1),
+                F.softmax(t_cls / self.T, dim=-1),
+                reduction="batchmean"
+            ) * (self.T ** 2)
+
+            # DFL KD
+            B, A, _ = s_dfl.shape
+            s_dfl = s_dfl.view(B, A, 4, self.reg_max)
+            t_dfl = t_dfl.view(B, A, 4, self.reg_max)
+
+            loss_dfl = F.kl_div(
+                F.log_softmax(s_dfl / self.T, dim=-1),
+                F.softmax(t_dfl / self.T, dim=-1),
+                reduction="batchmean"
+            ) * (self.T ** 2)
+
+            total += loss_cls + 0.5 * loss_dfl
+
+        return total / max(len(s_preds), 1)
+
+class DistillationTrainer:
+    """Orchestrator for feature-based knowledge distillation during training.
+
+    Hooks into intermediate layers of both teacher and student, collects feature maps
+    during forward passes, and computes diffkd loss.
+
+    Args:
+        student (nn.Module): The student model being trained.
+        teacher (nn.Module): The frozen teacher model.
+        distiller (str): 'DiffKDLoss'.
+        layers (list[str]): Layer indices (as strings) to hook into. Defaults to
+            YOLO backbone/neck layers ["6","8","13","16","19","22"].
+    """
+
+    DEFAULT_LAYERS = ["6","8","11","14","17","20"]
+
+    def __init__(self, student, teacher, distiller="diffkd", layers=None, device=None,
+                 layer_weights=None, logit_weight=0.5, num_classes=1, reg_max=16):
+        """Initialize DistillationTrainer and discover matching layers in both models."""
+        self.distiller = distiller.lower().replace("loss", "")
+        self.layers = layers or self.DEFAULT_LAYERS
+        self.student = student
+        self.teacher = teacher
+        self._handles = []
+        self.logit_weight = logit_weight
+        self.student_logits = []
+        self.teacher_logits = []
+
+        # Use the actual device of the student model (important for DDP multi-GPU)
+        if device is None:
+            try:
+                device = next(student.parameters()).device
+            except StopIteration:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(device) if not isinstance(device, torch.device) else device
+
+        # Warm-up forward pass so all lazy shapes are materialized before we
+        # scan for layers. Wrap in try/except because the teacher may use
+        # model-specific forward signatures (e.g. returns tuple, uses lists).
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, 640, 640, device=self.device)
+            try:
+                student(dummy)
+            except Exception:
+                pass  # student forward warmup best-effort
+            try:
+                # Some YOLO models expect a batch dict; try plain tensor first
+                teacher(dummy)
+            except TypeError:
+                try:
+                    teacher({"img": dummy})  # fallback for models expecting dict
+                except Exception:
+                    pass  # teacher warmup best-effort; layer scan still works
+
+        self.channels_s, self.channels_t = [], []
+        self.teacher_modules, self.student_modules = [], []
+        self._find_layers()
+
+        self.loss_fn = FeatureLoss(
+            channels_s=self.channels_s,
+            channels_t=self.channels_t,
+            distiller=self.distiller,
+            layer_weights=layer_weights,
+            device=self.device,
+        ).to(self.device)  # ensure all align_module / norm layers are on the right GPU
+
+        # Logit distillation loss (cls + DFL KL divergence)
+        self.logit_loss_fn = LogitDistillationLoss(
+            nc=num_classes,
+            reg_max=reg_max,
+            T=4.0,
+        ).to(self.device)
+
+        self.teacher_outputs = []
+        self.student_outputs = []
+
+    def _find_layers(self):
+        """Scan both models for cv2 sub-layers at the specified layer indices.
+
+        Handles 3 common YOLO module structures:
+          1. DetectionModel  → named_modules yields "model.6.cv2.bn", prefix="model"
+          2. nn.Sequential   → named_modules yields "6.cv2.bn",        prefix=""  (bare seq)
+          3. Wrapped model   → tries both, falls back to Sequential scan
+        """
+        def _collect(model, target_list, channel_list):
+            found = []
+            for name, module in model.named_modules():
+                parts = name.split(".")
+                # Case 1: "model.6.cv2.bn"  → parts[0]="model", parts[1]=idx, parts[2]=cv2
+                # Case 2: "6.cv2.bn"        → parts[0]=idx,     parts[1]=cv2
+                if len(parts) >= 3 and parts[0] == "model" and parts[1] in self.layers and "cv2" in parts[2]:
+                    if hasattr(module, "conv"):
+                        found.append((name, module))
+                elif len(parts) >= 2 and parts[0] in self.layers and "cv2" in parts[1]:
+                    if hasattr(module, "conv"):
+                        found.append((name, module))
+
+            # Deduplicate: keep deepest matching path per layer index
+            seen = {}
+            for name, module in found:
+                parts = name.split(".")
+                idx = parts[1] if parts[0] == "model" else parts[0]
+                # prefer deeper path (e.g. "model.6.cv2.conv" over "model.6.cv2")
+                if idx not in seen or len(name) > len(seen[idx][0]):
+                    seen[idx] = (name, module)
+
+            for idx in sorted(seen.keys(), key=lambda x: int(x)):
+                _, module = seen[idx]
+                channel_list.append(module.conv.out_channels)
+                target_list.append(module)
+
+        _collect(self.teacher, self.teacher_modules, self.channels_t)
+        _collect(self.student, self.student_modules, self.channels_s)
+
+        if len(self.channels_t) == 0 or len(self.channels_s) == 0:
+            # Debug: print all named_modules to help diagnose
+            LOGGER.warning("DistillationTrainer: layer scan failed. Dumping model structure for diagnosis:")
+            for tag, mdl in [("TEACHER", self.teacher), ("STUDENT", self.student)]:
+                names = [n for n, _ in mdl.named_modules() if "cv2" in n][:20]
+                LOGGER.warning(f"  {tag} cv2 layers (first 20): {names}")
+            raise RuntimeError(
+                f"DistillationTrainer: no matching layers found for indices {self.layers}. "
+                f"See logged cv2 layer names above to identify the correct layer indices for your model."
+            )
+
+        # Align to the shorter list (student may have fewer layers than teacher)
+        n = min(len(self.channels_s), len(self.channels_t))
+        self.channels_s = self.channels_s[-n:]
+        self.channels_t = self.channels_t[-n:]
+        self.teacher_modules = self.teacher_modules[-n:]
+        self.student_modules = self.student_modules[-n:]
+        LOGGER.info(f"DistillationTrainer: hooked {n} layer pairs | "
+                    f"student channels={self.channels_s} | teacher channels={self.channels_t}")
+
+    def register_hooks(self):
+        """Register forward hooks on matched teacher and student layers.
+
+        Must be called once at the start of each epoch before the training loop.
+        """
+        self.remove_hooks()
+        self.teacher_outputs.clear()
+        self.student_outputs.clear()
+        self.student_logits.clear()
+        self.teacher_logits.clear()
+
+        def _make_hook(storage, detach=False):
+            def hook(m, inp, out):
+                feat = out.detach() if detach else out
+                storage.append(feat)
+            return hook
+
+        def _make_logit_hook(storage):
+            """Hook for Detect head — captures raw prediction tensors per scale."""
+            def hook(m, inp, out):
+                # out is a list/tuple of tensors per detection scale
+                if isinstance(out, (list, tuple)):
+                    storage.append([o.detach().clone() for o in out if torch.is_tensor(o)])
+
+                elif isinstance(out, dict):
+                    storage.append({k: v.detach().clone() for k, v in out.items() if torch.is_tensor(v)})
+
+                elif torch.is_tensor(out):
+                    storage.append(out.detach().clone())
+
+                else:
+                    storage.append(out)
+            return hook
+
+        for t_mod, s_mod in zip(self.teacher_modules, self.student_modules):
+            self._handles.append(t_mod.register_forward_hook(_make_hook(self.teacher_outputs, detach=True)))
+            self._handles.append(s_mod.register_forward_hook(_make_hook(self.student_outputs, detach=False)))
+
+        # Hook the Detect heads for logit distillation
+        if self.logit_weight > 0:
+            t_detect = self._find_detect_head(self.teacher)
+            s_detect = self._find_detect_head(self.student)
+            if t_detect is not None and s_detect is not None:
+                self._handles.append(t_detect.register_forward_hook(_make_logit_hook(self.teacher_logits)))
+                self._handles.append(s_detect.register_forward_hook(_make_logit_hook(self.student_logits)))
+
+    def _find_detect_head(self, model):
+        """Find the Detect head module in a YOLO model."""
+        for name, module in model.named_modules():
+            if type(module).__name__ == "Detect":
+                return module
+        return None
+
+    def get_loss(self):
+        """Compute and return the distillation loss, then clear stored feature maps.
+
+        Returns:
+            (torch.Tensor): Scalar distillation loss (0 if no features collected).
+        """
+        if not self.teacher_outputs or not self.student_outputs:
+            return torch.tensor(0.0, requires_grad=True)
+        if len(self.teacher_outputs) != len(self.student_outputs):
+            LOGGER.warning(
+                f"DistillationTrainer: mismatched feature count "
+                f"(teacher={len(self.teacher_outputs)}, student={len(self.student_outputs)}). Skipping."
+            )
+            self.teacher_outputs.clear()
+            self.student_outputs.clear()
+            self.student_logits.clear()
+            self.teacher_logits.clear()
+            return torch.tensor(0.0, requires_grad=True)
+
+        # Feature distillation loss
+        loss = self.loss_fn(y_s=self.student_outputs, y_t=self.teacher_outputs)
+
+        # Logit distillation loss (cls KL + DFL KL)
+        if self.logit_weight > 0 and self.student_logits and self.teacher_logits:
+            try:
+                s_logits = self.student_logits[-1]
+                t_logits = self.teacher_logits[-1]
+                # Detect head returns list of per-scale tensors during training
+                if isinstance(s_logits, list) and isinstance(t_logits, list):
+                    logit_loss = self.logit_loss_fn(s_logits, t_logits)
+                    loss = loss + self.logit_weight * logit_loss
+            except Exception as e:
+                LOGGER.warning(f"DistillationTrainer: logit loss skipped ({e})")
+
+        self.teacher_outputs.clear()
+        self.student_outputs.clear()
+        self.student_logits.clear()
+        self.teacher_logits.clear()
+        return loss
+
+    def remove_hooks(self):
+        """Remove all registered forward hooks. Call at the end of each epoch."""
+        for h in self._handles:
+            h.remove()
+        self._handles.clear()
 
 
 class BaseTrainer:
@@ -116,31 +462,30 @@ class BaseTrainer:
         """
         self.hub_session = overrides.pop("session", None)  # HUB
         # ------------------------------------------------------------------
-        # Knowledge Distillation: pop custom args trước get_cfg() để tránh
-        # "unknown key" warnings. Chỉ nhận path (str/Path) — không nhận
-        # nn.Module trực tiếp để tránh vấn đề DDP pickling.
+        # Distillation: extract teacher + loss type before get_cfg() to avoid
+        # "unknown key" warnings. teacher_path is used by DDP subprocesses to
+        # reload the teacher without pickling an nn.Module across process boundaries.
         # ------------------------------------------------------------------
         _teacher_raw = overrides.pop("teacher", None)
-        self.teacher_ckpt   = overrides.pop("teacher_ckpt", None)
-        self.teacher_name   = overrides.pop("teacher_name", None)   # key trong KD_MODULES, vd: 'irformer'
-        self.student_name   = overrides.pop("student_name", None)   # key trong KD_MODULES, vd: 'yolov10s'
-        self.kd_loss_weight = overrides.pop("kd_loss_weight", 1.0)
-        self.kd_loss_kwargs = overrides.pop("kd_loss_kwargs", {})
+        self.distillation_loss = overrides.pop("distillation_loss", "DiffKDLoss")
 
-        self.teacher = None
         if isinstance(_teacher_raw, (str, Path)):
+            # User passed a file path → all ranks can load it directly
+            self.teacher = None
             self.teacher_path = str(_teacher_raw)
+        elif isinstance(_teacher_raw, torch.nn.Module):
+            # User passed a live model → save to a temp file so DDP worker
+            # ranks can load it without pickling across subprocess boundary.
+            # Save as checkpoint dict (not raw object) to preserve YOLO structure.
+            self.teacher = _teacher_raw
+            import tempfile as _tempfile
+            _tmp = _tempfile.NamedTemporaryFile(suffix="_teacher_distill.pt", delete=False)
+            torch.save({"model": deepcopy(_teacher_raw)}, _tmp.name)
+            self.teacher_path = _tmp.name
+            _tmp.close()
         else:
-            # DDP không hỗ trợ pickle nn.Module qua subprocess — yêu cầu path
-            if _teacher_raw is not None:
-                LOGGER.warning(
-                    "KD: 'teacher' phải là str/Path dẫn đến file .pt. "
-                    "Truyền nn.Module trực tiếp không được hỗ trợ (DDP). "
-                    "Distillation bị tắt."
-                )
+            self.teacher = None
             self.teacher_path = None   # distillation disabled
-
-        self.kd_loss_fn = None  # sẽ được khởi tạo trong _do_train sau khi model lên device
         # ------------------------------------------------------------------
         self.args = get_cfg(cfg, overrides)
         self.check_resume(overrides)
@@ -249,14 +594,11 @@ class BaseTrainer:
                     f"please specify a valid batch size multiple of GPU count {self.world_size}, i.e. batch={self.world_size * 8}."
                 )
 
-            # Inject distillation args vào self.args để generate_ddp_command pick up.
-            # DDP worker ranks load teacher theo path — không pickle nn.Module.
+            # Inject distillation args into self.args so generate_ddp_command picks them up.
+            # DDP worker ranks load the teacher by path (no nn.Module pickling needed).
             if self.teacher_path is not None:
-                self.args.teacher       = self.teacher_path
-                self.args.teacher_name  = self.teacher_name
-                self.args.student_name  = self.student_name
-                self.args.kd_loss_weight = self.kd_loss_weight
-                self.args.kd_loss_kwargs = self.kd_loss_kwargs
+                self.args.teacher = self.teacher_path
+                self.args.distillation_loss = self.distillation_loss
 
             # Command
             cmd, file = generate_ddp_command(self)
@@ -411,60 +753,63 @@ class BaseTrainer:
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
 
         # ------------------------------------------------------------------
-        # Knowledge Distillation setup — dùng KDLoss (DiffKD / feature-level)
+        # Knowledge Distillation setup
         # ------------------------------------------------------------------
-        if self.teacher_path is not None and self.kd_loss_fn is None:
-            from models.losses.kd_loss import KDLoss
-            from ultralytics.utils.loss import E2EDetectLoss
+        distill_trainer = None
+        if self.teacher_path is not None:
+            # Lazy-load: DDP worker ranks arrive here without a live teacher object
+            if self.teacher is None:
+                LOGGER.info(f"{colorstr('Distillation:')} loading teacher from '{self.teacher_path}'")
+                ckpt = torch.load(self.teacher_path, map_location="cpu", weights_only=False)
+                # Handle both checkpoint dict {"model": ...} and raw .pt files
+                if isinstance(ckpt, dict):
+                    self.teacher = ckpt.get("model") or ckpt.get("ema")
+                    if self.teacher is None:
+                        raise ValueError(
+                            f"Distillation: checkpoint '{self.teacher_path}' has no 'model' or 'ema' key. "
+                            f"Available keys: {list(ckpt.keys())}"
+                        )
+                else:
+                    self.teacher = ckpt  # raw nn.Module saved directly
+                # Unwrap YOLO wrapper layers until we reach the bare DetectionModel
+                # (YOLO → .model → DetectionModel; DetectionModel → .model → nn.Sequential)
+                # We want DetectionModel so named_modules yields "model.6.cv2.*"
+                for _ in range(5):  # max 5 levels deep
+                    if hasattr(self.teacher, "model") and isinstance(self.teacher.model, torch.nn.Module):
+                        # Stop if current level already has "model.X.cv2" structure
+                        has_cv2 = any(
+                            "cv2" in n and n.split(".")[0] == "model"
+                            for n, _ in self.teacher.named_modules()
+                        )
+                        if has_cv2:
+                            break
+                        self.teacher = self.teacher.model
+                    else:
+                        break
+                LOGGER.info(
+                    f"{colorstr('Distillation:')} teacher resolved to "
+                    f"{type(self.teacher).__name__} "
+                    f"(cv2 layers: {sum(1 for n,_ in self.teacher.named_modules() if 'cv2' in n)})"
+                )
 
-            # 1. Load teacher từ checkpoint
-            LOGGER.info(f"{colorstr('KD:')} loading teacher from '{self.teacher_path}'")
-            ckpt = torch.load(self.teacher_path, map_location="cpu", weights_only=False)
-            if isinstance(ckpt, dict):
-                # Hỗ trợ cả {"state_dict": ...} (IRFormer) lẫn {"model": ...} (YOLO ckpt)
-                raw = ckpt.get("state_dict") or ckpt.get("model") or ckpt.get("ema")
-                if raw is None:
-                    raise ValueError(
-                        f"KD: checkpoint '{self.teacher_path}' không có key 'state_dict'/'model'/'ema'. "
-                        f"Keys hiện có: {list(ckpt.keys())}"
-                    )
-            else:
-                raw = ckpt  # raw nn.Module
-
-            # Nếu raw là state_dict (OrderedDict) thì cần khởi tạo model trước
-            if isinstance(raw, dict):
-                # state_dict — subclass phải override build_teacher_model()
-                self.teacher = self.build_teacher_model()
-                self.teacher.load_state_dict(raw, strict=False)
-            else:
-                self.teacher = raw  # nn.Module
-
+            LOGGER.info(
+                f"{colorstr('Distillation:')} enabled | loss='{self.distillation_loss}' | "
+                f"teacher={type(self.teacher).__name__} | "
+                f"student device={self.device}"
+            )
             self.teacher = self.teacher.to(self.device).eval()
             for p in self.teacher.parameters():
                 p.requires_grad = False
 
-            LOGGER.info(
-                f"{colorstr('KD:')} teacher={type(self.teacher).__name__} | "
-                f"student={type(unwrap_model(self.model)).__name__} | "
-                f"method= DiffKD | weight={self.kd_loss_weight}"
-            )
-
-            # 2. Khởi tạo KDLoss
-            student_model = unwrap_model(self.model)
-
-            ori_loss = E2EDetectLoss(student_model)
-
-            self.kd_loss_fn = KDLoss(
-                student=student_model,
+            distill_trainer = DistillationTrainer(
+                student=unwrap_model(self.model),
                 teacher=self.teacher,
-                student_name=self.student_name,
-                teacher_name=self.teacher_name,
-                ori_loss=ori_loss,
-                kd_loss_weight=self.kd_loss_weight,
-                kd_loss_kwargs=self.kd_loss_kwargs,
+                distiller=self.distillation_loss,
+                device=self.device,
+                logit_weight=0.5,      # logit KL loss weight
+                num_classes=getattr(unwrap_model(self.model), "nc", 2),
+                reg_max=getattr(getattr(unwrap_model(self.model), "model", None), "reg_max", 16) or 16,
             )
-            
-            student_model.criterion = ori_loss
         # ------------------------------------------------------------------
 
         epoch = self.start_epoch
@@ -478,6 +823,8 @@ class BaseTrainer:
                 self.scheduler.step()
 
             self._model_train()
+            if distill_trainer is not None:
+                distill_trainer.register_hooks()
             if RANK != -1:
                 self.train_loader.sampler.set_epoch(epoch)
             pbar = enumerate(self.train_loader)
@@ -514,15 +861,11 @@ class BaseTrainer:
                 try:
                     with autocast(self.amp):
                         batch = self.preprocess_batch(batch)
-                        if self.kd_loss_fn is not None:
-                            preds = unwrap_model(self.model)(batch["img"])   # ✅ raw predictions
-                            loss, self.loss_items = self.kd_loss_fn(preds, batch)
-                        elif self.args.compile:
-                            # Standard mode (compile)
+                        if self.args.compile:
+                            # Decouple inference and loss calculations for improved compile performance
                             preds = self.model(batch["img"])
                             loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
                         else:
-                            # Standard mode
                             loss, self.loss_items = self.model(batch)
                         self.loss = loss.sum()
                         if RANK != -1:
@@ -530,6 +873,18 @@ class BaseTrainer:
                         self.tloss = (
                             self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
                         )
+
+                        # Distillation loss -----------------------------------
+                        if distill_trainer is not None:
+                            with torch.no_grad():
+                                self.teacher(batch["img"])  # trigger teacher hooks
+                            # Epoch-based cosine decay: 1.0 → 0.1 across training
+                            distill_weight = (
+                                (1 - math.cos(epoch * math.pi / self.epochs)) / 2
+                            ) * (0.1 - 1.0) + 1.0
+                            d_loss = distill_trainer.get_loss() * distill_weight
+                            self.loss = self.loss + d_loss
+                        # -----------------------------------------------------
 
                     # Backward
                     self.scaler.scale(self.loss).backward()
@@ -592,7 +947,9 @@ class BaseTrainer:
             if self._oom_retries and not self.stop:
                 continue  # OOM recovery broke the for loop, restart with reduced batch size
 
-            # Remove distillation hooks sau mỗi epoch (KDLoss dùng persistent hooks — không cần)
+            # Remove distillation hooks after each epoch
+            if distill_trainer is not None:
+                distill_trainer.remove_hooks()
 
             if hasattr(unwrap_model(self.model).criterion, "update"):
                 unwrap_model(self.model).criterion.update()
@@ -649,6 +1006,9 @@ class BaseTrainer:
 
         seconds = time.time() - self.train_time_start
         LOGGER.info(f"\n{epoch - self.start_epoch + 1} epochs completed in {seconds / 3600:.3f} hours.")
+        # Cleanup distillation hooks on finish
+        if distill_trainer is not None:
+            distill_trainer.remove_hooks()
         # Do final val with best.pt
         self.final_eval()
         if RANK in {-1, 0}:
@@ -847,9 +1207,6 @@ class BaseTrainer:
     def get_model(self, cfg=None, weights=None, verbose=True):
         """Get model and raise NotImplementedError for loading cfg files."""
         raise NotImplementedError("This task trainer doesn't support loading cfg files")
-
-    def build_teacher_model(self) -> torch.nn.Module:
-        raise NotImplementedError("build_teacher_model function not implemented in trainer")
 
     def get_validator(self):
         """Raise NotImplementedError (must be implemented by subclasses)."""

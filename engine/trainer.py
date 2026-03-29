@@ -29,7 +29,7 @@ class DetectionTrainer(BaseTrainer):
         """Override để load IRFormer teacher từ state_dict."""
         from models.irformer import Model as IRFormer
         return IRFormer(in_nc=3, out_nc=3, base_nf=16)
-
+    
     def build_dataset(self, img_path, mode="train", batch=None):
         gs = max(int(unwrap_model(self.model).stride.max()), 32)
         return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)

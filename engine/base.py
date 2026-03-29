@@ -17,7 +17,7 @@ from torch import distributed as dist
 from torch import nn, optim
 import torch.nn.functional as F
 
-from models.diffkd import KLDivergence, DiffKD
+from models.diffkd import DiffKD
 
 from ultralytics import __version__
 from ultralytics.cfg import get_cfg, get_save_dir

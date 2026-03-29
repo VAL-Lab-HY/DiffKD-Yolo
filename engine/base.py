@@ -123,7 +123,7 @@ class FeatureLoss(nn.Module):
         return self.loss_weight * total_loss / sum(self.layer_weights)
 
 class LogitDistillationLoss(nn.Module):
-    def __init__(self, nc=2, reg_max=16, T=4.0):
+    def __init__(self, nc=1, reg_max=16, T=4.0):
         super().__init__()
         self.nc = nc
         self.reg_max = reg_max
@@ -807,7 +807,7 @@ class BaseTrainer:
                 distiller=self.distillation_loss,
                 device=self.device,
                 logit_weight=0.5,      # logit KL loss weight
-                num_classes=getattr(unwrap_model(self.model), "nc", 2),
+                num_classes=getattr(unwrap_model(self.model), "nc", 1),
                 reg_max=getattr(getattr(unwrap_model(self.model), "model", None), "reg_max", 16) or 16,
             )
         # ------------------------------------------------------------------

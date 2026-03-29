@@ -229,7 +229,6 @@ class DistillationTrainer:
         self.loss_fn = FeatureLoss(
             channels_s=self.channels_s,
             channels_t=self.channels_t,
-            distiller=self.distiller,
             layer_weights=layer_weights,
             device=self.device,
         ).to(self.device)  # ensure all align_module / norm layers are on the right GPU

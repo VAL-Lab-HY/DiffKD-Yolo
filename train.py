@@ -12,6 +12,9 @@ def get_args():
     # KD
     parser.add_argument("--model", type=str, default="yolov10s.pt")
     parser.add_argument("--teacher", type=str, required=True, help="Path to teacher model checkpoint.")
+    parser.add_argument("--data", type=str, default="data/coco.yaml", help="Path to dataset config file.")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=16)
 
     return parser.parse_args()
 
@@ -21,6 +24,9 @@ def build_overrides(args) -> dict:
     overrides = {
         "model": args.model,             # str path → BaseTrainer load
         "teacher": args.teacher,           # str path → BaseTrainer load
+        "data": args.data,               # str path → BaseTrainer build_dataset
+        "epochs": args.epochs,           # int → BaseTrainer train loop
+        "batch_size": args.batch_size,   # int → BaseTrainer get_dataloader
     }
     # Bỏ resume nếu không truyền
     if not overrides["resume"]:

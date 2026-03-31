@@ -103,7 +103,6 @@ class FeatureLoss(nn.Module):
         ])
 
     def forward(self, y_s, y_t):
-
         if len(y_s) != len(y_t):
             y_t = y_t[-len(y_s):]
 
@@ -111,6 +110,10 @@ class FeatureLoss(nn.Module):
 
         for i, (s, t) in enumerate(zip(y_s, y_t)):
             s = self.align[i](s)
+
+            # Align spatial size: teacher → student size    
+            if s.shape[2:] != t.shape[2:]:
+                t = F.adaptive_avg_pool2d(t, output_size=s.shape[2:])
 
             s, t, diff_loss, ae_loss = self.diffkd[i](s, t.detach())
 
@@ -182,10 +185,12 @@ class DistillationTrainer:
             YOLO backbone/neck layers ["6","8","13","16","19","22"].
     """
 
-    DEFAULT_LAYERS = ["6","8","11","14","17","20"]
+    DEFAULT_LAYERS = ["6"]
 
     def __init__(self, student, teacher, distiller="diffkd", layers=None, device=None,
-                 layer_weights=None, logit_weight=0.5, num_classes=1, reg_max=16):
+                layer_weights=None, logit_weight=0.5, num_classes=1, reg_max=16,
+                teacher_layer_names=None, student_layer_names=None,
+                teacher_channels=None, student_channels=None):
         """Initialize DistillationTrainer and discover matching layers in both models."""
         self.distiller = distiller.lower().replace("loss", "")
         self.layers = layers or self.DEFAULT_LAYERS
@@ -207,20 +212,26 @@ class DistillationTrainer:
         # Warm-up forward pass so all lazy shapes are materialized before we
         # scan for layers. Wrap in try/except because the teacher may use
         # model-specific forward signatures (e.g. returns tuple, uses lists).
+        self._teacher_layer_names = teacher_layer_names
+        self._student_layer_names = student_layer_names
+        self._teacher_channels_override = teacher_channels
+        self._student_channels_override = student_channels
+
         with torch.no_grad():
             dummy = torch.zeros(1, 3, 640, 640, device=self.device)
             try:
                 student(dummy)
             except Exception:
                 pass  # student forward warmup best-effort
-            try:
-                # Some YOLO models expect a batch dict; try plain tensor first
-                teacher(dummy)
-            except TypeError:
+            # Chỉ warmup teacher nếu dùng YOLO-to-YOLO (không dùng custom layer names)
+            if self._teacher_layer_names is None:
                 try:
-                    teacher({"img": dummy})  # fallback for models expecting dict
-                except Exception:
-                    pass  # teacher warmup best-effort; layer scan still works
+                    teacher(dummy)
+                except TypeError:
+                    try:
+                        teacher({"img": dummy})
+                    except Exception:
+                        pass
 
         self.channels_s, self.channels_t = [], []
         self.teacher_modules, self.student_modules = [], []
@@ -244,35 +255,76 @@ class DistillationTrainer:
         self.student_outputs = []
 
     def _find_layers(self):
-        """Scan both models for cv2 sub-layers at the specified layer indices.
+        """Hook layers: theo tên tùy chỉnh (cross-architecture) hoặc cv2 YOLO mặc định."""
+        if self._teacher_layer_names is not None and self._student_layer_names is not None:
+            self._find_layers_by_name()
+        else:
+            self._find_layers_by_cv2()
 
-        Handles 3 common YOLO module structures:
-          1. DetectionModel  → named_modules yields "model.6.cv2.bn", prefix="model"
-          2. nn.Sequential   → named_modules yields "6.cv2.bn",        prefix=""  (bare seq)
-          3. Wrapped model   → tries both, falls back to Sequential scan
-        """
+    def _infer_out_channels(self, module):
+        """Tự detect out_channels từ attribute hoặc Conv2d/Linear cuối cùng."""
+        for attr in ("out_channels", "embed_dim", "dim", "num_features", "hidden_dim"):
+            if hasattr(module, attr):
+                return getattr(module, attr)
+        last_conv = None
+        for m in module.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                last_conv = m
+        if last_conv is not None:
+            return last_conv.out_channels if isinstance(last_conv, nn.Conv2d) else last_conv.out_features
+        raise RuntimeError(
+            f"Cannot infer out_channels for {type(module).__name__}. "
+            "Pass teacher_channels / student_channels explicitly."
+        )
+
+    def _find_layers_by_name(self):
+        """Hook theo tên module tùy chỉnh — dùng cho cross-architecture (IRFormer → YOLOv10s)."""
+        def _collect(model, target_names, module_list, channel_list, channels_override):
+            named = dict(model.named_modules())
+            for i, name in enumerate(target_names):
+                if name not in named:
+                    raise RuntimeError(
+                        f"DistillationTrainer: module '{name}' not found. "
+                        f"First 30 modules: {list(named.keys())[:30]}"
+                    )
+                module = named[name]
+                module_list.append(module)
+                ch = (channels_override[i]
+                      if channels_override is not None and i < len(channels_override)
+                      else self._infer_out_channels(module))
+                channel_list.append(ch)
+                LOGGER.info(f"  ✓ hooked '{name}' → out_channels={ch}")
+
+        LOGGER.info(f"DistillationTrainer: hooking by name | "
+                    f"teacher={self._teacher_layer_names} | student={self._student_layer_names}")
+        _collect(self.teacher, self._teacher_layer_names,
+                 self.teacher_modules, self.channels_t, self._teacher_channels_override)
+        _collect(self.student, self._student_layer_names,
+                 self.student_modules, self.channels_s, self._student_channels_override)
+        assert len(self.channels_s) == len(self.channels_t), (
+            f"teacher layers ({len(self.channels_t)}) != student layers ({len(self.channels_s)})"
+        )
+        LOGGER.info(f"DistillationTrainer: hooked {len(self.channels_s)} pair(s) | "
+                    f"student_ch={self.channels_s} | teacher_ch={self.channels_t}")
+
+    def _find_layers_by_cv2(self):
+        """Logic tìm cv2 cũ — giữ nguyên cho YOLO-to-YOLO distillation."""
         def _collect(model, target_list, channel_list):
             found = []
             for name, module in model.named_modules():
                 parts = name.split(".")
-                # Case 1: "model.6.cv2.bn"  → parts[0]="model", parts[1]=idx, parts[2]=cv2
-                # Case 2: "6.cv2.bn"        → parts[0]=idx,     parts[1]=cv2
                 if len(parts) >= 3 and parts[0] == "model" and parts[1] in self.layers and "cv2" in parts[2]:
                     if hasattr(module, "conv"):
                         found.append((name, module))
                 elif len(parts) >= 2 and parts[0] in self.layers and "cv2" in parts[1]:
                     if hasattr(module, "conv"):
                         found.append((name, module))
-
-            # Deduplicate: keep deepest matching path per layer index
             seen = {}
             for name, module in found:
                 parts = name.split(".")
                 idx = parts[1] if parts[0] == "model" else parts[0]
-                # prefer deeper path (e.g. "model.6.cv2.conv" over "model.6.cv2")
                 if idx not in seen or len(name) > len(seen[idx][0]):
                     seen[idx] = (name, module)
-
             for idx in sorted(seen.keys(), key=lambda x: int(x)):
                 _, module = seen[idx]
                 channel_list.append(module.conv.out_channels)
@@ -282,7 +334,6 @@ class DistillationTrainer:
         _collect(self.student, self.student_modules, self.channels_s)
 
         if len(self.channels_t) == 0 or len(self.channels_s) == 0:
-            # Debug: print all named_modules to help diagnose
             LOGGER.warning("DistillationTrainer: layer scan failed. Dumping model structure for diagnosis:")
             for tag, mdl in [("TEACHER", self.teacher), ("STUDENT", self.student)]:
                 names = [n for n, _ in mdl.named_modules() if "cv2" in n][:20]
@@ -292,7 +343,6 @@ class DistillationTrainer:
                 f"See logged cv2 layer names above to identify the correct layer indices for your model."
             )
 
-        # Align to the shorter list (student may have fewer layers than teacher)
         n = min(len(self.channels_s), len(self.channels_t))
         self.channels_s = self.channels_s[-n:]
         self.channels_t = self.channels_t[-n:]
@@ -300,6 +350,7 @@ class DistillationTrainer:
         self.student_modules = self.student_modules[-n:]
         LOGGER.info(f"DistillationTrainer: hooked {n} layer pairs | "
                     f"student channels={self.channels_s} | teacher channels={self.channels_t}")
+        
 
     def register_hooks(self):
         """Register forward hooks on matched teacher and student layers.
@@ -800,14 +851,26 @@ class BaseTrainer:
             for p in self.teacher.parameters():
                 p.requires_grad = False
 
+            # Đọc cross-architecture config từ args nếu có, fallback về YOLO-to-YOLO
+            _t_layer_names = getattr(self.args, "teacher_layer_names", None)  # e.g. ["transformer"]
+            _s_layer_names = getattr(self.args, "student_layer_names", None)  # e.g. ["model.4"]
+            _t_channels    = getattr(self.args, "teacher_channels", None)     # e.g. [16]
+            _s_channels    = getattr(self.args, "student_channels", None)     # e.g. None
+            # logit KD chỉ có nghĩa khi teacher là detector (YOLO-to-YOLO)
+            _logit_w = 0.0 if _t_layer_names is not None else 0.5
+
             distill_trainer = DistillationTrainer(
                 student=unwrap_model(self.model),
                 teacher=self.teacher,
                 distiller=self.distillation_loss,
                 device=self.device,
-                logit_weight=0.5,      # logit KL loss weight
+                logit_weight=_logit_w,
                 num_classes=getattr(unwrap_model(self.model), "nc", 1),
                 reg_max=getattr(getattr(unwrap_model(self.model), "model", None), "reg_max", 16) or 16,
+                teacher_layer_names=_t_layer_names,
+                student_layer_names=_s_layer_names,
+                teacher_channels=_t_channels,
+                student_channels=_s_channels,
             )
         # ------------------------------------------------------------------
 
@@ -876,8 +939,21 @@ class BaseTrainer:
                         # Distillation loss -----------------------------------
                         if distill_trainer is not None:
                             with torch.no_grad():
-                                self.teacher(batch["img"])  # trigger teacher hooks
-                            # Epoch-based cosine decay: 1.0 → 0.1 across training
+                                try:
+                                    if distill_trainer._teacher_layer_names is not None:
+                                        # Cross-architecture (IRFormer): resize về input size của teacher
+                                        teacher_input = F.interpolate(
+                                            batch["img"],
+                                            size=(256, 256),
+                                            mode="bilinear",
+                                            align_corners=False,
+                                        )
+                                    else:
+                                        # YOLO-to-YOLO: dùng nguyên batch["img"]
+                                        teacher_input = batch["img"]
+                                    self.teacher(teacher_input)
+                                except Exception as e:
+                                    LOGGER.warning(f"Distillation: teacher forward failed ({e}), skipping batch.")
                             distill_weight = (
                                 (1 - math.cos(epoch * math.pi / self.epochs)) / 2
                             ) * (0.1 - 1.0) + 1.0

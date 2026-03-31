@@ -96,12 +96,6 @@ class FeatureLoss(nn.Module):
             for s, t in zip(channels_s, channels_t)
         ])
 
-        # channel align
-        self.align = nn.ModuleList([
-            nn.Conv2d(s, t, 1).to(device)
-            for s, t in zip(channels_s, channels_t)
-        ])
-
     def forward(self, y_s, y_t):
         if len(y_s) != len(y_t):
             y_t = y_t[-len(y_s):]
@@ -109,12 +103,11 @@ class FeatureLoss(nn.Module):
         total_loss = 0.0
 
         for i, (s, t) in enumerate(zip(y_s, y_t)):
-            s = self.align[i](s)
-
-            # Align spatial size: teacher → student size    
+            # Align spatial size teacher → student trước khi vào DiffKD
             if s.shape[2:] != t.shape[2:]:
                 t = F.adaptive_avg_pool2d(t, output_size=s.shape[2:])
 
+            # DiffKD tự xử lý channel align bên trong (trans conv: s→t)
             s, t, diff_loss, ae_loss = self.diffkd[i](s, t.detach())
 
             loss = diff_loss
@@ -124,6 +117,7 @@ class FeatureLoss(nn.Module):
             total_loss += loss * self.layer_weights[i]
 
         return self.loss_weight * total_loss / sum(self.layer_weights)
+
 
 class LogitDistillationLoss(nn.Module):
     def __init__(self, nc=1, reg_max=16, T=4.0):

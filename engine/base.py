@@ -485,7 +485,7 @@ class BaseTrainer:
         # ------------------------------------------------------------------
         _teacher_raw = overrides.pop("teacher", None)
         self.ae_channels = overrides.pop("ae_channels", 32)
-        self.kd_loss_weight = overrides.pop("kd_loss_weight", 10.0)
+        self.kd_loss_weight = overrides.pop("kd_loss_weight", 0.5)
 
         if isinstance(_teacher_raw, (str, Path)):
             # User passed a file path → all ranks can load it directly

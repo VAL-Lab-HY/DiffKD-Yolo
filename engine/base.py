@@ -843,9 +843,18 @@ class BaseTrainer:
                 ae_channels=self.ae_channels,
             )
             if distill_trainer is not None:
-                # Lấy các param của DiffKD và thêm vào optimizer
+                # Lấy các tham số cần học của bộ DiffKD (bao gồm Projector và Denoising net)
                 kd_params = list(distill_trainer.loss_fn.diffkd.parameters())
-                self.optimizer.add_param_group({"params": kd_params, "lr": self.args.lr0})
+                
+                if len(kd_params) > 0:
+                    self.optimizer.add_param_group({
+                        "params": kd_params, 
+                        "lr": self.args.lr0, 
+                        "initial_lr": self.args.lr0, # DÒNG NÀY LÀ BẮT BUỘC để tránh KeyError
+                        "weight_decay": self.args.weight_decay,
+                        "param_group": "kd_diffkd"    # Đặt tên để dễ quản lý
+                    })
+                    LOGGER.info(f"DEBUG: Đã thêm {len(kd_params)} tham số DiffKD vào Optimizer.")
         # ------------------------------------------------------------------
 
         epoch = self.start_epoch

@@ -275,6 +275,17 @@ class DistillationTrainer:
         _collect(self.teacher, self.teacher_modules, self.channels_t, "TEACHER")
         _collect(self.student, self.student_modules, self.channels_s, "STUDENT")
 
+    def _infer_out_channels(self, module):
+        """Lấy số lượng channel đầu ra của một module."""
+        if hasattr(module, 'out_channels'):
+            return module.out_channels
+        if hasattr(module, 'cv2') and hasattr(module.cv2, 'conv'): # Cấu trúc C2f/C3k2 của YOLO
+            return module.cv2.conv.out_channels
+        # Fallback: chạy thử một tensor dummy qua module
+        dummy = torch.zeros(1, 3, 32, 32).to(self.device) # Giả định input channel là 3, thực tế cần linh hoạt hơn
+        # Tuy nhiên cách tốt nhất là truy cập trực tiếp thuộc tính conv của module đó
+        return None
+
     def get_loss(self):
         """Tính toán loss và in debug giá trị loss thực tế."""
         if not self.teacher_outputs or not self.student_outputs:

@@ -60,63 +60,66 @@ from ultralytics.utils.torch_utils import (
 
 
 class FeatureLoss(nn.Module):
-    def __init__(
-        self,
-        channels_s,
-        channels_t,
-        loss_weight=1.0,
-        device=None,
-        layer_weights=None,
-        ae_weight=0.3,
-    ):
+    def __init__(self, channels_s, channels_t, loss_weight=2.0, device=None, layer_weights=None, ae_weight=0.3):
         super().__init__()
-
         self.loss_weight = loss_weight
         self.ae_weight = ae_weight
-
+        
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        device = torch.device(device)
+        self.device = torch.device(device)
 
-        # layer weights (deep layer > shallow)
+        # 1. Khởi tạo layer weights (sâu hơn thì trọng số cao hơn)
         if layer_weights is None:
             n = len(channels_s)
-            self.layer_weights = [0.5 + 1.5 * i / max(n - 1, 1) for i in range(n)]
+            # Tránh chia cho 0 nếu chỉ có 1 layer
+            denom = max(n - 1, 1)
+            self.layer_weights = [0.5 + 1.5 * i / denom for i in range(n)]
         else:
             self.layer_weights = layer_weights
 
-        # DiffKD per layer
+        # 2. Khởi tạo DiffKD cho từng cặp layer
         self.diffkd = nn.ModuleList([
             DiffKD(
                 s, t,
                 kernel_size=3,
                 use_ae=True,
-                ae_channels=64
-            ).to(device)
+                ae_channels=128
+            ).to(self.device)
             for s, t in zip(channels_s, channels_t)
         ])
+        
+        # DEBUG: Kiểm tra xem đã khởi tạo bao nhiêu bộ DiffKD
+        LOGGER.info(f"DEBUG: FeatureLoss initialized with {len(self.diffkd)} layers alignment.")
 
     def forward(self, y_s, y_t):
+        # Phòng trường hợp không có feature maps nào được hook
+        if len(y_s) == 0 or len(y_t) == 0:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+        
+        # Đồng bộ số lượng layer nếu lệch
         if len(y_s) != len(y_t):
             y_t = y_t[-len(y_s):]
 
         total_loss = 0.0
-
+        
         for i, (s, t) in enumerate(zip(y_s, y_t)):
-            # Align spatial size teacher → student trước khi vào DiffKD
+            # Resize Teacher feature map nếu lệch kích thước không gian (H, W)
             if s.shape[2:] != t.shape[2:]:
-                t = F.adaptive_avg_pool2d(t, output_size=s.shape[2:])
+                t = F.interpolate(t, size=s.shape[2:], mode='bilinear', align_corners=False)
 
-            # DiffKD tự xử lý channel align bên trong (trans conv: s→t)
-            s, t, diff_loss, ae_loss = self.diffkd[i](s, t.detach())
-
+            # Tính toán qua DiffKD (s: student, t: teacher)
+            # t.detach() để đảm bảo không tính gradient ngược về Teacher
+            s_proc, t_proc, diff_loss, ae_loss = self.diffkd[i](s, t.detach())
+            
             loss = diff_loss
             if ae_loss is not None:
                 loss += self.ae_weight * ae_loss
-
+            
             total_loss += loss * self.layer_weights[i]
 
-        return self.loss_weight * total_loss / sum(self.layer_weights)
+        # Trả về loss trung bình có nhân trọng số loss_weight
+        return self.loss_weight * (total_loss / sum(self.layer_weights))
 
 
 class LogitDistillationLoss(nn.Module):
@@ -166,110 +169,142 @@ class LogitDistillationLoss(nn.Module):
         return total / max(len(s_preds), 1)
 
 class DistillationTrainer:
-    """Orchestrator for feature-based knowledge distillation during training.
+    DEFAULT_LAYERS = ["6", "8", "10"] 
 
-    Hooks into intermediate layers of both teacher and student, collects feature maps
-    during forward passes, and computes diffkd loss.
-
-    Args:
-        student (nn.Module): The student model being trained.
-        teacher (nn.Module): The frozen teacher model.
-        distiller (str): 'DiffKDLoss'.
-        layers (list[str]): Layer indices (as strings) to hook into. Defaults to
-            YOLO backbone/neck layers ["6","8","13","16","19","22"].
-    """
-
-    DEFAULT_LAYERS = ["6"]
-
-    def __init__(self, student, teacher, distiller="diffkd", layers=None, device=None,
-                layer_weights=None, logit_weight=0.5, num_classes=1, reg_max=16,
-                teacher_layer_names=None, student_layer_names=None,
-                teacher_channels=None, student_channels=None):
-        """Initialize DistillationTrainer and discover matching layers in both models."""
-        self.distiller = distiller.lower().replace("loss", "")
+    def __init__(self, student, teacher, layers=None, device=None, 
+                 layer_weights=None, logit_weight=1.0, num_classes=1, reg_max=16,
+                 teacher_layer_names=None, student_layer_names=None,
+                 teacher_channels=None, student_channels=None):
+        
         self.layers = layers or self.DEFAULT_LAYERS
         self.student = student
         self.teacher = teacher
         self._handles = []
         self.logit_weight = logit_weight
-        self.student_logits = []
-        self.teacher_logits = []
+        
+        # DEBUG: Khởi tạo danh sách chứa output
+        self.student_outputs, self.teacher_outputs = [], []
+        self.student_logits, self.teacher_logits = [], []
 
-        # Use the actual device of the student model (important for DDP multi-GPU)
+        # Xử lý Device
         if device is None:
-            try:
-                device = next(student.parameters()).device
-            except StopIteration:
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device = torch.device(device) if not isinstance(device, torch.device) else device
+            device = next(student.parameters()).device
+        self.device = torch.device(device)
 
-        # Warm-up forward pass so all lazy shapes are materialized before we
-        # scan for layers. Wrap in try/except because the teacher may use
-        # model-specific forward signatures (e.g. returns tuple, uses lists).
+        # Gán các cấu hình layer
         self._teacher_layer_names = teacher_layer_names
         self._student_layer_names = student_layer_names
         self._teacher_channels_override = teacher_channels
         self._student_channels_override = student_channels
 
+        # --- DEBUG: KIỂM TRA CẤU TRÚC MODEL TRƯỚC KHI HOOK ---
+        LOGGER.info(f"DEBUG: Khởi tạo Distillation giữa {type(teacher).__name__} và {type(student).__name__}")
+
+        # Warm-up (Best effort)
         with torch.no_grad():
             dummy = torch.zeros(1, 3, 640, 640, device=self.device)
-            try:
-                student(dummy)
-            except Exception:
-                pass  # student forward warmup best-effort
-            # Chỉ warmup teacher nếu dùng YOLO-to-YOLO (không dùng custom layer names)
-            if self._teacher_layer_names is None:
-                try:
-                    teacher(dummy)
-                except TypeError:
-                    try:
-                        teacher({"img": dummy})
-                    except Exception:
-                        pass
+            try: student(dummy)
+            except: pass
+            try: teacher(dummy)
+            except: pass
 
         self.channels_s, self.channels_t = [], []
         self.teacher_modules, self.student_modules = [], []
+        
+        # Tìm layer để hook
         self._find_layers()
 
+        # --- DEBUG: KIỂM TRA SỐ LƯỢNG LAYER ĐÃ HOOK ---
+        if len(self.teacher_modules) == 0:
+            LOGGER.error(f"CRITICAL: Không tìm thấy layer nào để hook với indices: {self.layers}!")
+        else:
+            LOGGER.info(f"DEBUG: Đã hook thành công {len(self.teacher_modules)} cặp layers.")
+            LOGGER.info(f"DEBUG: Channels Student: {self.channels_s} | Channels Teacher: {self.channels_t}")
+
+        # Khởi tạo Loss functions
         self.loss_fn = FeatureLoss(
             channels_s=self.channels_s,
             channels_t=self.channels_t,
             layer_weights=layer_weights,
             device=self.device,
-        ).to(self.device)  # ensure all align_module / norm layers are on the right GPU
+        ).to(self.device)
 
-        # Logit distillation loss (cls + DFL KL divergence)
         self.logit_loss_fn = LogitDistillationLoss(
             nc=num_classes,
             reg_max=reg_max,
             T=4.0,
         ).to(self.device)
 
-        self.teacher_outputs = []
-        self.student_outputs = []
-
     def _find_layers(self):
-        """Hook layers: theo tên tùy chỉnh (cross-architecture) hoặc cv2 YOLO mặc định."""
-        if self._teacher_layer_names is not None and self._student_layer_names is not None:
+        """Tự động chọn phương thức tìm layer."""
+        if self._teacher_layer_names and self._student_layer_names:
+            LOGGER.info("DEBUG: Đang tìm layer theo tên (Cross-Architecture)...")
             self._find_layers_by_name()
         else:
+            LOGGER.info(f"DEBUG: Đang tìm layer theo CV2 Index: {self.layers} (YOLO-to-YOLO)...")
             self._find_layers_by_cv2()
 
-    def _infer_out_channels(self, module):
-        """Tự detect out_channels từ attribute hoặc Conv2d/Linear cuối cùng."""
-        for attr in ("out_channels", "embed_dim", "dim", "num_features", "hidden_dim"):
-            if hasattr(module, attr):
-                return getattr(module, attr)
-        last_conv = None
-        for m in module.modules():
-            if isinstance(m, (nn.Conv2d, nn.Linear)):
-                last_conv = m
-        if last_conv is not None:
-            return last_conv.out_channels if isinstance(last_conv, nn.Conv2d) else last_conv.out_features
-        raise RuntimeError(
-            f"Cannot infer out_channels for {type(module).__name__}. "
-            "Pass teacher_channels / student_channels explicitly."
-        )
+    def _find_layers_by_cv2(self):
+        """Logic tìm layer dựa trên cấu trúc mặc định của Ultralytics (model.N.cv2)."""
+        def _collect(model, target_list, channel_list, tag=""):
+            found = []
+            for name, module in model.named_modules():
+                # Tìm các module có chứa 'cv2' trong các layer index đã định nghĩa
+                parts = name.split(".")
+                if len(parts) >= 2 and parts[0] == "model" and parts[1] in self.layers and "cv2" in name:
+                    # Đảm bảo module có thuộc tính .conv để lấy out_channels
+                    m = module.conv if hasattr(module, "conv") else module
+                    found.append((name, m))
+            
+            # Chỉ lấy module sâu nhất cho mỗi index
+            seen = {}
+            for name, m in found:
+                idx = name.split(".")[1]
+                seen[idx] = (name, m)
+            
+            for idx in sorted(seen.keys(), key=lambda x: int(x)):
+                n, m = seen[idx]
+                ch = self._infer_out_channels(m)
+                channel_list.append(ch)
+                target_list.append(m)
+                LOGGER.info(f"  ✓ [{tag}] Hooked layer {n} | Channels: {ch}")
+
+        _collect(self.teacher, self.teacher_modules, self.channels_t, "TEACHER")
+        _collect(self.student, self.student_modules, self.channels_s, "STUDENT")
+
+    def get_loss(self):
+        """Tính toán loss và in debug giá trị loss thực tế."""
+        if not self.teacher_outputs or not self.student_outputs:
+            # Nếu chạy vào đây là do forward hook không hoạt động
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        # 1. Feature Loss
+        feat_loss = self.loss_fn(y_s=self.student_outputs, y_t=self.teacher_outputs)
+
+        # 2. Logit Loss
+        logit_loss = torch.tensor(0.0, device=self.device)
+        if self.logit_weight > 0 and self.student_logits and self.teacher_logits:
+            try:
+                # Lấy kết quả từ scale cuối cùng (thường là list các tensors)
+                s_l = self.student_logits[-1]
+                t_l = self.teacher_logits[-1]
+                logit_loss = self.logit_loss_fn(s_l, t_l) * self.logit_weight
+            except Exception as e:
+                pass # Bỏ qua nếu mismatch shape logit
+
+        total_distill_loss = feat_loss + logit_loss
+
+        # --- DEBUG LOSS VALUE (Chỉ in ở Rank 0 để tránh spam) ---
+        if torch.rand(1) < 0.01: # In ngẫu nhiên 1% số batch để theo dõi
+            LOGGER.info(f"DEBUG: Distill Loss = {total_distill_loss.item():.4f} (Feat: {feat_loss.item():.4f}, Logit: {logit_loss.item():.4f})")
+
+        # Xóa sạch cache để tránh rò rỉ bộ nhớ batch sau
+        self.teacher_outputs.clear()
+        self.student_outputs.clear()
+        self.student_logits.clear()
+        self.teacher_logits.clear()
+        
+        return total_distill_loss
 
     def _find_layers_by_name(self):
         """Hook theo tên module tùy chỉnh — dùng cho cross-architecture (IRFormer → YOLOv10s)."""
@@ -300,51 +335,6 @@ class DistillationTrainer:
         )
         LOGGER.info(f"DistillationTrainer: hooked {len(self.channels_s)} pair(s) | "
                     f"student_ch={self.channels_s} | teacher_ch={self.channels_t}")
-
-    def _find_layers_by_cv2(self):
-        """Logic tìm cv2 cũ — giữ nguyên cho YOLO-to-YOLO distillation."""
-        def _collect(model, target_list, channel_list):
-            found = []
-            for name, module in model.named_modules():
-                parts = name.split(".")
-                if len(parts) >= 3 and parts[0] == "model" and parts[1] in self.layers and "cv2" in parts[2]:
-                    if hasattr(module, "conv"):
-                        found.append((name, module))
-                elif len(parts) >= 2 and parts[0] in self.layers and "cv2" in parts[1]:
-                    if hasattr(module, "conv"):
-                        found.append((name, module))
-            seen = {}
-            for name, module in found:
-                parts = name.split(".")
-                idx = parts[1] if parts[0] == "model" else parts[0]
-                if idx not in seen or len(name) > len(seen[idx][0]):
-                    seen[idx] = (name, module)
-            for idx in sorted(seen.keys(), key=lambda x: int(x)):
-                _, module = seen[idx]
-                channel_list.append(module.conv.out_channels)
-                target_list.append(module)
-
-        _collect(self.teacher, self.teacher_modules, self.channels_t)
-        _collect(self.student, self.student_modules, self.channels_s)
-
-        if len(self.channels_t) == 0 or len(self.channels_s) == 0:
-            LOGGER.warning("DistillationTrainer: layer scan failed. Dumping model structure for diagnosis:")
-            for tag, mdl in [("TEACHER", self.teacher), ("STUDENT", self.student)]:
-                names = [n for n, _ in mdl.named_modules() if "cv2" in n][:20]
-                LOGGER.warning(f"  {tag} cv2 layers (first 20): {names}")
-            raise RuntimeError(
-                f"DistillationTrainer: no matching layers found for indices {self.layers}. "
-                f"See logged cv2 layer names above to identify the correct layer indices for your model."
-            )
-
-        n = min(len(self.channels_s), len(self.channels_t))
-        self.channels_s = self.channels_s[-n:]
-        self.channels_t = self.channels_t[-n:]
-        self.teacher_modules = self.teacher_modules[-n:]
-        self.student_modules = self.student_modules[-n:]
-        LOGGER.info(f"DistillationTrainer: hooked {n} layer pairs | "
-                    f"student channels={self.channels_s} | teacher channels={self.channels_t}")
-        
 
     def register_hooks(self):
         """Register forward hooks on matched teacher and student layers.
@@ -398,46 +388,6 @@ class DistillationTrainer:
             if type(module).__name__ == "Detect":
                 return module
         return None
-
-    def get_loss(self):
-        """Compute and return the distillation loss, then clear stored feature maps.
-
-        Returns:
-            (torch.Tensor): Scalar distillation loss (0 if no features collected).
-        """
-        if not self.teacher_outputs or not self.student_outputs:
-            return torch.tensor(0.0, requires_grad=True)
-        if len(self.teacher_outputs) != len(self.student_outputs):
-            LOGGER.warning(
-                f"DistillationTrainer: mismatched feature count "
-                f"(teacher={len(self.teacher_outputs)}, student={len(self.student_outputs)}). Skipping."
-            )
-            self.teacher_outputs.clear()
-            self.student_outputs.clear()
-            self.student_logits.clear()
-            self.teacher_logits.clear()
-            return torch.tensor(0.0, requires_grad=True)
-
-        # Feature distillation loss
-        loss = self.loss_fn(y_s=self.student_outputs, y_t=self.teacher_outputs)
-
-        # Logit distillation loss (cls KL + DFL KL)
-        if self.logit_weight > 0 and self.student_logits and self.teacher_logits:
-            try:
-                s_logits = self.student_logits[-1]
-                t_logits = self.teacher_logits[-1]
-                # Detect head returns list of per-scale tensors during training
-                if isinstance(s_logits, list) and isinstance(t_logits, list):
-                    logit_loss = self.logit_loss_fn(s_logits, t_logits)
-                    loss = loss + self.logit_weight * logit_loss
-            except Exception as e:
-                LOGGER.warning(f"DistillationTrainer: logit loss skipped ({e})")
-
-        self.teacher_outputs.clear()
-        self.student_outputs.clear()
-        self.student_logits.clear()
-        self.teacher_logits.clear()
-        return loss
 
     def remove_hooks(self):
         """Remove all registered forward hooks. Call at the end of each epoch."""
@@ -511,7 +461,7 @@ class BaseTrainer:
         # reload the teacher without pickling an nn.Module across process boundaries.
         # ------------------------------------------------------------------
         _teacher_raw = overrides.pop("teacher", None)
-        self.distillation_loss = overrides.pop("distillation_loss", "DiffKDLoss")
+        self.kd_loss_weight = overrides.pop("kd_loss_weight", 1.0)
 
         if isinstance(_teacher_raw, (str, Path)):
             # User passed a file path → all ranks can load it directly
@@ -642,7 +592,6 @@ class BaseTrainer:
             # DDP worker ranks load the teacher by path (no nn.Module pickling needed).
             if self.teacher_path is not None:
                 self.args.teacher = self.teacher_path
-                self.args.distillation_loss = self.distillation_loss
 
             # Command
             cmd, file = generate_ddp_command(self)
@@ -837,7 +786,7 @@ class BaseTrainer:
                 )
 
             LOGGER.info(
-                f"{colorstr('Distillation:')} enabled | loss='{self.distillation_loss}' | "
+                f"{colorstr('Distillation:')} enabled | "
                 f"teacher={type(self.teacher).__name__} | "
                 f"student device={self.device}"
             )
@@ -856,7 +805,6 @@ class BaseTrainer:
             distill_trainer = DistillationTrainer(
                 student=unwrap_model(self.model),
                 teacher=self.teacher,
-                distiller=self.distillation_loss,
                 device=self.device,
                 logit_weight=_logit_w,
                 num_classes=getattr(unwrap_model(self.model), "nc", 1),
@@ -942,16 +890,14 @@ class BaseTrainer:
                                             mode="bilinear",
                                             align_corners=False,
                                         )
+                                        print(f"{distill_trainer._teacher_layer_names}")
                                     else:
                                         # YOLO-to-YOLO: dùng nguyên batch["img"]
                                         teacher_input = batch["img"]
                                     self.teacher(teacher_input)
                                 except Exception as e:
                                     LOGGER.warning(f"Distillation: teacher forward failed ({e}), skipping batch.")
-                            distill_weight = (
-                                (1 - math.cos(epoch * math.pi / self.epochs)) / 2
-                            ) * (0.1 - 1.0) + 1.0
-                            d_loss = distill_trainer.get_loss() * distill_weight
+                            d_loss = distill_trainer.get_loss() * self.kd_loss_weight
                             self.loss = self.loss + d_loss
                         # -----------------------------------------------------
 

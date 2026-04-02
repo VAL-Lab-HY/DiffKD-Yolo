@@ -276,14 +276,26 @@ class DistillationTrainer:
         _collect(self.student, self.student_modules, self.channels_s, "STUDENT")
 
     def _infer_out_channels(self, module):
-        """Lấy số lượng channel đầu ra của một module."""
-        if hasattr(module, 'out_channels'):
+        """Tự động nhận diện và lấy số channel đầu ra từ module được hook."""
+        # 1. Nếu là lớp Conv2d thông thường
+        if hasattr(module, "out_channels"):
             return module.out_channels
-        if hasattr(module, 'cv2') and hasattr(module.cv2, 'conv'): # Cấu trúc C2f/C3k2 của YOLO
-            return module.cv2.conv.out_channels
-        # Fallback: chạy thử một tensor dummy qua module
-        dummy = torch.zeros(1, 3, 32, 32).to(self.device) # Giả định input channel là 3, thực tế cần linh hoạt hơn
-        # Tuy nhiên cách tốt nhất là truy cập trực tiếp thuộc tính conv của module đó
+        
+        # 2. Nếu là lớp BatchNorm2d (Trường hợp bạn đang gặp phải)
+        if hasattr(module, "num_features"):
+            return module.num_features
+        
+        # 3. Nếu là wrapper của Ultralytics (như lớp Conv bọc cả Conv2d+BN)
+        if hasattr(module, "conv") and hasattr(module.conv, "out_channels"):
+            return module.conv.out_channels
+            
+        # 4. Fallback cuối cùng: thử lấy từ tham số nếu module là một lớp nn.Module đơn giản
+        for m in module.modules():
+            if isinstance(m, nn.Conv2d):
+                return m.out_channels
+            if isinstance(m, nn.BatchNorm2d):
+                return m.num_features
+                
         return None
 
     def get_loss(self):

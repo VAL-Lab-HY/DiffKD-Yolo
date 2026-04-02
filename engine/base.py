@@ -487,8 +487,8 @@ class BaseTrainer:
         # reload the teacher without pickling an nn.Module across process boundaries.
         # ------------------------------------------------------------------
         _teacher_raw = overrides.pop("teacher", None)
-        self.ae_channels = overrides.pop("ae_channels", 64)
-        self.kd_loss_weight = overrides.pop("kd_loss_weight", 1.0)
+        self.ae_channels = overrides.pop("ae_channels", 32)
+        self.kd_loss_weight = overrides.pop("kd_loss_weight", 10.0)
 
         if isinstance(_teacher_raw, (str, Path)):
             # User passed a file path → all ranks can load it directly

@@ -60,11 +60,12 @@ from ultralytics.utils.torch_utils import (
 
 
 class FeatureLoss(nn.Module):
-    def __init__(self, channels_s, channels_t, loss_weight=2.0, device=None, layer_weights=None, ae_weight=0.3):
+    def __init__(self, channels_s, channels_t, loss_weight=2.0, device=None, layer_weights=None, ae_weight=0.3, ae_channels=64):
         super().__init__()
         self.loss_weight = loss_weight
         self.ae_weight = ae_weight
-        
+        self.ae_channels = ae_channels
+
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
@@ -84,7 +85,7 @@ class FeatureLoss(nn.Module):
                 s, t,
                 kernel_size=3,
                 use_ae=True,
-                ae_channels=128
+                ae_channels=self.ae_channels
             ).to(self.device)
             for s, t in zip(channels_s, channels_t)
         ])
@@ -169,19 +170,20 @@ class LogitDistillationLoss(nn.Module):
         return total / max(len(s_preds), 1)
 
 class DistillationTrainer:
-    DEFAULT_LAYERS = ["6", "8", "10"] 
+    DEFAULT_LAYERS = ["4"] 
 
     def __init__(self, student, teacher, layers=None, device=None, 
                  layer_weights=None, logit_weight=1.0, num_classes=1, reg_max=16,
                  teacher_layer_names=None, student_layer_names=None,
-                 teacher_channels=None, student_channels=None):
+                 teacher_channels=None, student_channels=None, ae_channels=64):
         
         self.layers = layers or self.DEFAULT_LAYERS
         self.student = student
         self.teacher = teacher
         self._handles = []
         self.logit_weight = logit_weight
-        
+        self.ae_channels = ae_channels
+
         # DEBUG: Khởi tạo danh sách chứa output
         self.student_outputs, self.teacher_outputs = [], []
         self.student_logits, self.teacher_logits = [], []
@@ -226,6 +228,7 @@ class DistillationTrainer:
             channels_s=self.channels_s,
             channels_t=self.channels_t,
             layer_weights=layer_weights,
+            ae_channels=self.ae_channels,
             device=self.device,
         ).to(self.device)
 
@@ -461,6 +464,7 @@ class BaseTrainer:
         # reload the teacher without pickling an nn.Module across process boundaries.
         # ------------------------------------------------------------------
         _teacher_raw = overrides.pop("teacher", None)
+        self.ae_channels = overrides.pop("ae_channels", 64)
         self.kd_loss_weight = overrides.pop("kd_loss_weight", 1.0)
 
         if isinstance(_teacher_raw, (str, Path)):
@@ -813,7 +817,12 @@ class BaseTrainer:
                 student_layer_names=_s_layer_names,
                 teacher_channels=_t_channels,
                 student_channels=_s_channels,
+                ae_channels=self.ae_channels,
             )
+            if distill_trainer is not None:
+                # Lấy các param của DiffKD và thêm vào optimizer
+                kd_params = list(distill_trainer.loss_fn.diffkd.parameters())
+                self.optimizer.add_param_group({"params": kd_params, "lr": self.args.lr0})
         # ------------------------------------------------------------------
 
         epoch = self.start_epoch
@@ -880,20 +889,28 @@ class BaseTrainer:
 
                         # Distillation loss -----------------------------------
                         if distill_trainer is not None:
+                            # with torch.no_grad():
+                            #     try:
+                            #         if distill_trainer._teacher_layer_names is not None:
+                            #             # Cross-architecture (IRFormer): resize về input size của teacher
+                            #             teacher_input = F.interpolate(
+                            #                 batch["img"],
+                            #                 size=(256, 256),
+                            #                 mode="bilinear",
+                            #                 align_corners=False,
+                            #             )
+                            #             print(f"{distill_trainer._teacher_layer_names}")
+                            #         else:
+                            #             # YOLO-to-YOLO: dùng nguyên batch["img"]
+                            #             teacher_input = batch["img"]
+                            #         self.teacher(teacher_input)
+                            #     except Exception as e:
+                            #         LOGGER.warning(f"Distillation: teacher forward failed ({e}), skipping batch.")
+                            # Thay vì resize 256x256
                             with torch.no_grad():
                                 try:
-                                    if distill_trainer._teacher_layer_names is not None:
-                                        # Cross-architecture (IRFormer): resize về input size của teacher
-                                        teacher_input = F.interpolate(
-                                            batch["img"],
-                                            size=(256, 256),
-                                            mode="bilinear",
-                                            align_corners=False,
-                                        )
-                                        print(f"{distill_trainer._teacher_layer_names}")
-                                    else:
-                                        # YOLO-to-YOLO: dùng nguyên batch["img"]
-                                        teacher_input = batch["img"]
+                                    # Đối với YOLO-to-YOLO, dùng thẳng batch["img"]
+                                    teacher_input = batch["img"] 
                                     self.teacher(teacher_input)
                                 except Exception as e:
                                     LOGGER.warning(f"Distillation: teacher forward failed ({e}), skipping batch.")

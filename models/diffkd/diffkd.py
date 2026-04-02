@@ -37,6 +37,14 @@ class DiffKD(nn.Module):
         self.proj = nn.Sequential(nn.Conv2d(teacher_channels, teacher_channels, 1), nn.BatchNorm2d(teacher_channels))
 
     def forward(self, student_feat, teacher_feat):
+        # Chuẩn hóa đặc trưng về phân phối chuẩn (mean=0, std=1)
+        eps = 1e-5
+        s_mean, s_var = student_feat.mean(dim=(1,2,3), keepdim=True), student_feat.var(dim=(1,2,3), keepdim=True)
+        student_feat = (student_feat - s_mean) / (s_var + eps).sqrt()
+        
+        t_mean, t_var = teacher_feat.mean(dim=(1,2,3), keepdim=True), teacher_feat.var(dim=(1,2,3), keepdim=True)
+        teacher_feat = (teacher_feat - t_mean) / (t_var + eps).sqrt()
+        
         # project student feature to the same dimension as teacher feature
         student_feat = self.trans(student_feat)
 

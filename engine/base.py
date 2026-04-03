@@ -60,74 +60,58 @@ from ultralytics.utils.torch_utils import (
 
 
 class FeatureLoss(nn.Module):
-    def __init__(self, channels_s, channels_t, loss_weight=2.0, device=None, layer_weights=None, ae_weight=0.3, ae_channels=64):
+    def __init__(self, channels_s, channels_t, loss_weight=2.0, device=None, layer_weights=None, ae_weight=0.05):
         super().__init__()
         self.loss_weight = loss_weight
         self.ae_weight = ae_weight
-        self.ae_channels = ae_channels
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
 
-        # 1. Khởi tạo layer weights (sâu hơn thì trọng số cao hơn)
+        # layer weights
         if layer_weights is None:
             n = len(channels_s)
-            # Tránh chia cho 0 nếu chỉ có 1 layer
             denom = max(n - 1, 1)
             self.layer_weights = [0.5 + 1.5 * i / denom for i in range(n)]
         else:
             self.layer_weights = layer_weights
 
-        # 2. Khởi tạo DiffKD cho từng cặp layer
         self.diffkd = nn.ModuleList([
-            DiffKD(
-                s, t,
-                kernel_size=3,
-                use_ae=True,
-                ae_channels=self.ae_channels
-            ).to(self.device)
+            DiffKD(s, t, kernel_size=3, use_ae=True).to(self.device)
             for s, t in zip(channels_s, channels_t)
         ])
-        
-        # DEBUG: Kiểm tra xem đã khởi tạo bao nhiêu bộ DiffKD
-        LOGGER.info(f"DEBUG: FeatureLoss initialized with {len(self.diffkd)} layers alignment.")
 
     def forward(self, y_s, y_t):
-        # Phòng trường hợp không có feature maps nào được hook
         if len(y_s) == 0 or len(y_t) == 0:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
-        
-        # Đồng bộ số lượng layer nếu lệch
+
         if len(y_s) != len(y_t):
             y_t = y_t[-len(y_s):]
 
         total_loss = 0.0
-        
+        total_weight = sum(self.layer_weights)
+
         for i, (s, t) in enumerate(zip(y_s, y_t)):
             if s.shape[2:] != t.shape[2:]:
-                t = F.interpolate(t, size=s.shape[2:], mode='bilinear', align_corners=False)
+                t = F.interpolate(
+                    t, size=s.shape[2:], mode='bilinear', align_corners=False
+                ).detach()
 
-            s_proc, t_proc, diff_loss, ae_loss = self.diffkd[i](s, t.detach())
+            s_proc, t_proc, kd_loss, ae_loss = self.diffkd[i](s, t.detach())
 
-            # Loss chính: kéo refined student feature → teacher feature space
-            kd_loss = F.mse_loss(s_proc, t_proc.detach())
+            loss = kd_loss
 
-            # diff_loss: train diffusion model (auxiliary)
-            # ae_loss: train autoencoder (auxiliary)
-            loss = kd_loss + diff_loss
             if ae_loss is not None:
                 loss += self.ae_weight * ae_loss
 
             if not torch.isfinite(loss):
-                LOGGER.warning(f"layer {i} NaN: kd={kd_loss.item():.4f} diff={diff_loss.item():.4f}")
-                continue
+                LOGGER.warning(f"layer {i} NaN → zero")
+                loss = torch.zeros_like(loss)
 
-            total_loss = total_loss + loss * self.layer_weights[i]
+            total_loss += loss * self.layer_weights[i]
 
-        # Trả về loss trung bình có nhân trọng số loss_weight
-        return self.loss_weight * (total_loss / sum(self.layer_weights))
-
+        return self.loss_weight * (total_loss / total_weight)
 
 class LogitDistillationLoss(nn.Module):
     def __init__(self, nc=1, reg_max=16, T=4.0):

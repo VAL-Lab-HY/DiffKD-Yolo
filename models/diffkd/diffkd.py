@@ -1,87 +1,95 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from .diffkd_modules import DiffusionModel, NoiseAdapter, AutoEncoder, DDIMPipeline
-from .scheduling_ddim import DDIMScheduler
-
 
 class DiffKD(nn.Module):
     def __init__(
-            self,
-            student_channels,
-            teacher_channels,
-            kernel_size=3,
-            inference_steps=5,
-            num_train_timesteps=1000,
-            use_ae=False,
-            ae_channels=None,
+        self,
+        student_channels,
+        teacher_channels,
+        kernel_size=3,
+        inference_steps=3,   # 🔥 giảm steps
+        num_train_timesteps=1000,
+        use_ae=False,
+        ae_channels=None,
     ):
         super().__init__()
         self.use_ae = use_ae
         self.diffusion_inference_steps = inference_steps
-        # AE for compress teacher feature
+
+        # ===== AE (optional, nhẹ hơn) =====
         if use_ae:
             if ae_channels is None:
                 ae_channels = teacher_channels // 2
-            self.ae = AutoEncoder(teacher_channels, ae_channels)
-            teacher_channels = ae_channels
-        
-        # transform student feature to the same dimension as teacher
+            self.ae = nn.Sequential(
+                nn.Conv2d(teacher_channels, ae_channels, 1),
+                nn.ReLU(),
+                nn.Conv2d(ae_channels, teacher_channels, 1)
+            )
+        else:
+            self.ae = None
+
+        # ===== align channel =====
         self.trans = nn.Conv2d(student_channels, teacher_channels, 1)
-        # diffusion model - predict noise
-        self.model = DiffusionModel(channels_in=teacher_channels, kernel_size=kernel_size)
-        self.scheduler = DDIMScheduler(num_train_timesteps=num_train_timesteps, clip_sample=False, beta_schedule="linear")
-        self.noise_adapter = NoiseAdapter(teacher_channels, kernel_size)
-        # pipeline for denoising student feature
-        self.pipeline = DDIMPipeline(self.model, self.scheduler, self.noise_adapter)
-        self.proj = nn.Sequential(nn.Conv2d(teacher_channels, teacher_channels, 1), nn.BatchNorm2d(teacher_channels))
+
+        # ===== diffusion model (nhẹ hơn) =====
+        self.model = nn.Sequential(
+            nn.Conv2d(teacher_channels, teacher_channels, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(teacher_channels, teacher_channels, 3, padding=1),
+        )
+
+        # ❌ bỏ BatchNorm → dùng GroupNorm
+        self.proj = nn.Sequential(
+            nn.Conv2d(teacher_channels, teacher_channels, 1),
+            nn.GroupNorm(8, teacher_channels)
+        )
+
+    def normalize(self, x):
+        # 🔥 ổn định hơn var()
+        mean = x.mean(dim=(2,3), keepdim=True)
+        std = x.std(dim=(2,3), keepdim=True) + 1e-6
+        return (x - mean) / std
 
     def forward(self, student_feat, teacher_feat):
-        # Chuẩn hóa đặc trưng về phân phối chuẩn (mean=0, std=1)
-        eps = 1e-5
-        s_mean, s_var = student_feat.mean(dim=(1,2,3), keepdim=True), student_feat.var(dim=(1,2,3), keepdim=True)
-        student_feat = (student_feat - s_mean) / (s_var + eps).sqrt()
-        
-        t_mean, t_var = teacher_feat.mean(dim=(1,2,3), keepdim=True), teacher_feat.var(dim=(1,2,3), keepdim=True)
-        teacher_feat = (teacher_feat - t_mean) / (t_var + eps).sqrt()
-        
-        # project student feature to the same dimension as teacher feature
+        # ===== normalize nhẹ =====
+        student_feat = self.normalize(student_feat)
+        teacher_feat = self.normalize(teacher_feat)
+
+        # ===== align =====
         student_feat = self.trans(student_feat)
 
-        # use autoencoder on teacher feature
-        if self.use_ae:
-            hidden_t_feat, rec_t_feat = self.ae(teacher_feat)
-            rec_loss = F.mse_loss(teacher_feat, rec_t_feat)
-            teacher_feat = hidden_t_feat.detach()
+        # ===== AE (optional) =====
+        if self.ae is not None:
+            rec = self.ae(teacher_feat)
+            rec_loss = F.l1_loss(rec, teacher_feat)  # 🔥 L1 ổn định hơn MSE
+            teacher_feat = rec.detach()
         else:
             rec_loss = None
 
-        # denoise student feature
-        refined_feat = self.pipeline(
-            batch_size=student_feat.shape[0],
-            device=student_feat.device,
-            dtype=student_feat.dtype,
-            shape=student_feat.shape[1:],
-            feat=student_feat,
-            num_inference_steps=self.diffusion_inference_steps,
-            proj=self.proj
-        )
+        # ===== diffusion (simple residual) =====
+        noise_pred = self.model(student_feat)
+        refined_feat = student_feat + noise_pred  # 🔥 residual stable
+
+        # ===== clamp để tránh explode =====
+        refined_feat = torch.clamp(refined_feat, -5, 5)
+
         refined_feat = self.proj(refined_feat)
+
+        # ===== KD loss (cosine + MSE) =====
+        kd_loss = self.kd_loss(refined_feat, teacher_feat)
+
+        return refined_feat, teacher_feat, kd_loss, rec_loss
+
+    def kd_loss(self, s, t):
+        # combine loss (rất hiệu quả cho detection)
         
-        # train diffusion model
-        ddim_loss = self.ddim_loss(teacher_feat)
-        return refined_feat, teacher_feat, ddim_loss, rec_loss
+        # cosine loss
+        cos = 1 - F.cosine_similarity(
+            s.flatten(1), t.flatten(1), dim=1
+        ).mean()
 
-    def ddim_loss(self, gt_feat):
-        # Sample noise to add to the images
-        noise = torch.randn(gt_feat.shape, device=gt_feat.device) #.to(gt_feat.device)
-        bs = gt_feat.shape[0]
+        # mse (nhẹ thôi)
+        mse = F.mse_loss(s, t)
 
-        # Sample a random timestep for each image
-        timesteps = torch.randint(0, self.scheduler.num_train_timesteps, (bs,), device=gt_feat.device).long()
-        # Add noise to the clean images according to the noise magnitude at each timestep
-        # (this is the forward diffusion process)
-        noisy_images = self.scheduler.add_noise(gt_feat, noise, timesteps)
-        noise_pred = self.model(noisy_images, timesteps)
-        loss = F.mse_loss(noise_pred, noise)
-        return loss
+        return 0.7 * cos + 0.3 * mse

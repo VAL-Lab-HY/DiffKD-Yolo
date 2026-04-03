@@ -112,8 +112,8 @@ class FeatureLoss(nn.Module):
             # Tính toán qua DiffKD (s: student, t: teacher)
             # t.detach() để đảm bảo không tính gradient ngược về Teacher
             s_proc, t_proc, diff_loss, ae_loss = self.diffkd[i](s, t.detach())
-            kd_loss = F.mse_loss(s_proc, t_proc.detach())  # loss chính của DiffKD
-            
+            # kd_loss = F.mse_loss(s_proc, t_proc.detach())  # loss chính của DiffKD
+            kd_loss = 0
             loss = diff_loss + kd_loss
             if ae_loss is not None:
                 loss += self.ae_weight * ae_loss

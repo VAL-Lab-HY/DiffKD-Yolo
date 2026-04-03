@@ -165,14 +165,13 @@ class DistillationTrainer:
     def __init__(self, student, teacher, layers=None, device=None, 
                  layer_weights=None, logit_weight=1.0, num_classes=1, reg_max=16,
                  teacher_layer_names=None, student_layer_names=None,
-                 teacher_channels=None, student_channels=None, ae_channels=64):
+                 teacher_channels=None, student_channels=None):
         
         self.layers = layers or self.DEFAULT_LAYERS
         self.student = student
         self.teacher = teacher
         self._handles = []
         self.logit_weight = logit_weight
-        self.ae_channels = ae_channels
 
         # DEBUG: Khởi tạo danh sách chứa output
         self.student_outputs, self.teacher_outputs = [], []
@@ -218,7 +217,6 @@ class DistillationTrainer:
             channels_s=self.channels_s,
             channels_t=self.channels_t,
             layer_weights=layer_weights,
-            ae_channels=self.ae_channels,
             device=self.device,
         ).to(self.device)
 
@@ -477,7 +475,6 @@ class BaseTrainer:
         # reload the teacher without pickling an nn.Module across process boundaries.
         # ------------------------------------------------------------------
         _teacher_raw = overrides.pop("teacher", None)
-        self.ae_channels = overrides.pop("ae_channels", 64)
         self.kd_loss_weight = overrides.pop("kd_loss_weight", 0.1)
 
         if isinstance(_teacher_raw, (str, Path)):
@@ -830,7 +827,6 @@ class BaseTrainer:
                 student_layer_names=_s_layer_names,
                 teacher_channels=_t_channels,
                 student_channels=_s_channels,
-                ae_channels=self.ae_channels,
             )
             if distill_trainer is not None:
                 # Lấy các tham số cần học của bộ DiffKD (bao gồm Projector và Denoising net)

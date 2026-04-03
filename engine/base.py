@@ -105,20 +105,25 @@ class FeatureLoss(nn.Module):
         total_loss = 0.0
         
         for i, (s, t) in enumerate(zip(y_s, y_t)):
-            # Resize Teacher feature map nếu lệch kích thước không gian (H, W)
             if s.shape[2:] != t.shape[2:]:
                 t = F.interpolate(t, size=s.shape[2:], mode='bilinear', align_corners=False)
 
-            # Tính toán qua DiffKD (s: student, t: teacher)
-            # t.detach() để đảm bảo không tính gradient ngược về Teacher
             s_proc, t_proc, diff_loss, ae_loss = self.diffkd[i](s, t.detach())
-            # kd_loss = F.mse_loss(s_proc, t_proc.detach())  # loss chính của DiffKD
-            kd_loss = 0
-            loss = diff_loss + kd_loss
+
+            # Loss chính: kéo refined student feature → teacher feature space
+            kd_loss = F.mse_loss(s_proc, t_proc.detach())
+
+            # diff_loss: train diffusion model (auxiliary)
+            # ae_loss: train autoencoder (auxiliary)
+            loss = kd_loss + diff_loss
             if ae_loss is not None:
                 loss += self.ae_weight * ae_loss
-            
-            total_loss += loss * self.layer_weights[i]
+
+            if not torch.isfinite(loss):
+                LOGGER.warning(f"layer {i} NaN: kd={kd_loss.item():.4f} diff={diff_loss.item():.4f}")
+                continue
+
+            total_loss = total_loss + loss * self.layer_weights[i]
 
         # Trả về loss trung bình có nhân trọng số loss_weight
         return self.loss_weight * (total_loss / sum(self.layer_weights))

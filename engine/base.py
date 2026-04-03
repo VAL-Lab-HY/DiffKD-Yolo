@@ -113,65 +113,17 @@ class FeatureLoss(nn.Module):
 
         return self.loss_weight * (total_loss / total_weight)
 
-class LogitDistillationLoss(nn.Module):
-    def __init__(self, nc=1, reg_max=16, T=4.0):
-        super().__init__()
-        self.nc = nc
-        self.reg_max = reg_max
-        self.T = T
-        self.box_split = 4 * reg_max
-
-    def forward(self, s_preds, t_preds):
-
-        total = 0.0
-
-        for s, t in zip(s_preds, t_preds):
-
-            if s.shape[1] == self.box_split + self.nc:
-                s = s.permute(0, 2, 1)
-                t = t.permute(0, 2, 1)
-
-            s_cls = s[..., self.box_split:]
-            t_cls = t[..., self.box_split:].detach()
-
-            s_dfl = s[..., :self.box_split]
-            t_dfl = t[..., :self.box_split].detach()
-
-            # CLS KD
-            loss_cls = F.kl_div(
-                F.log_softmax(s_cls / self.T, dim=-1),
-                F.softmax(t_cls / self.T, dim=-1),
-                reduction="batchmean"
-            ) * (self.T ** 2)
-
-            # DFL KD
-            B, A, _ = s_dfl.shape
-            s_dfl = s_dfl.view(B, A, 4, self.reg_max)
-            t_dfl = t_dfl.view(B, A, 4, self.reg_max)
-
-            loss_dfl = F.kl_div(
-                F.log_softmax(s_dfl / self.T, dim=-1),
-                F.softmax(t_dfl / self.T, dim=-1),
-                reduction="batchmean"
-            ) * (self.T ** 2)
-
-            total += loss_cls + 0.5 * loss_dfl
-
-        return total / max(len(s_preds), 1)
 
 class DistillationTrainer:
     DEFAULT_LAYERS = ["4"] 
 
-    def __init__(self, student, teacher, layers=None, device=None, 
-                 layer_weights=None, logit_weight=1.0, num_classes=1, reg_max=16,
-                 teacher_layer_names=None, student_layer_names=None,
-                 teacher_channels=None, student_channels=None):
+    def __init__(self, student, teacher, layers=None, device=None, layer_weights=None, num_classes=1, reg_max=16,
+                teacher_layer_names=None, student_layer_names=None, teacher_channels=None, student_channels=None):
         
         self.layers = layers or self.DEFAULT_LAYERS
         self.student = student
         self.teacher = teacher
         self._handles = []
-        self.logit_weight = logit_weight
 
         # DEBUG: Khởi tạo danh sách chứa output
         self.student_outputs, self.teacher_outputs = [], []
@@ -218,12 +170,6 @@ class DistillationTrainer:
             channels_t=self.channels_t,
             layer_weights=layer_weights,
             device=self.device,
-        ).to(self.device)
-
-        self.logit_loss_fn = LogitDistillationLoss(
-            nc=num_classes,
-            reg_max=reg_max,
-            T=4.0,
         ).to(self.device)
 
     def _find_layers(self):
@@ -292,25 +238,8 @@ class DistillationTrainer:
             # Nếu chạy vào đây là do forward hook không hoạt động
             return torch.tensor(0.0, device=self.device, requires_grad=True)
 
-        # 1. Feature Loss
+        # Feature Loss
         feat_loss = self.loss_fn(y_s=self.student_outputs, y_t=self.teacher_outputs)
-
-        # 2. Logit Loss
-        logit_loss = torch.tensor(0.0, device=self.device)
-        if self.logit_weight > 0 and self.student_logits and self.teacher_logits:
-            try:
-                # Lấy kết quả từ scale cuối cùng (thường là list các tensors)
-                s_l = self.student_logits[-1]
-                t_l = self.teacher_logits[-1]
-                logit_loss = self.logit_loss_fn(s_l, t_l) * self.logit_weight
-            except Exception as e:
-                pass # Bỏ qua nếu mismatch shape logit
-
-        total_distill_loss = feat_loss + logit_loss
-
-        # --- DEBUG LOSS VALUE (Chỉ in ở Rank 0 để tránh spam) ---
-        if torch.rand(1) < 0.01: # In ngẫu nhiên 1% số batch để theo dõi
-            LOGGER.info(f"DEBUG: Distill Loss = {total_distill_loss.item():.4f} (Feat: {feat_loss.item():.4f}, Logit: {logit_loss.item():.4f})")
 
         # Xóa sạch cache để tránh rò rỉ bộ nhớ batch sau
         self.teacher_outputs.clear()
@@ -318,7 +247,7 @@ class DistillationTrainer:
         self.student_logits.clear()
         self.teacher_logits.clear()
         
-        return total_distill_loss
+        return feat_loss
 
     def _find_layers_by_name(self):
         """Hook theo tên module tùy chỉnh — dùng cho cross-architecture (IRFormer → YOLOv10s)."""
@@ -387,14 +316,6 @@ class DistillationTrainer:
         for t_mod, s_mod in zip(self.teacher_modules, self.student_modules):
             self._handles.append(t_mod.register_forward_hook(_make_hook(self.teacher_outputs, detach=True)))
             self._handles.append(s_mod.register_forward_hook(_make_hook(self.student_outputs, detach=False)))
-
-        # Hook the Detect heads for logit distillation
-        if self.logit_weight > 0:
-            t_detect = self._find_detect_head(self.teacher)
-            s_detect = self._find_detect_head(self.student)
-            if t_detect is not None and s_detect is not None:
-                self._handles.append(t_detect.register_forward_hook(_make_logit_hook(self.teacher_logits)))
-                self._handles.append(s_detect.register_forward_hook(_make_logit_hook(self.student_logits)))
 
     def _find_detect_head(self, model):
         """Find the Detect head module in a YOLO model."""
@@ -813,14 +734,11 @@ class BaseTrainer:
             _s_layer_names = getattr(self.args, "student_layer_names", None)  # e.g. ["model.4"]
             _t_channels    = getattr(self.args, "teacher_channels", None)     # e.g. [16]
             _s_channels    = getattr(self.args, "student_channels", None)     # e.g. None
-            # logit KD chỉ có nghĩa khi teacher là detector (YOLO-to-YOLO)
-            _logit_w = 0.0 if _t_layer_names is not None else 0.5
 
             distill_trainer = DistillationTrainer(
                 student=unwrap_model(self.model),
                 teacher=self.teacher,
                 device=self.device,
-                logit_weight=_logit_w,
                 num_classes=getattr(unwrap_model(self.model), "nc", 1),
                 reg_max=getattr(getattr(unwrap_model(self.model), "model", None), "reg_max", 16) or 16,
                 teacher_layer_names=_t_layer_names,

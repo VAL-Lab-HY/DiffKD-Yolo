@@ -60,7 +60,7 @@ from ultralytics.utils.torch_utils import (
 
 
 class FeatureLoss(nn.Module):
-    def __init__(self, channels_s, channels_t, loss_weight=2.0, device=None, layer_weights=None, ae_weight=0.05):
+    def __init__(self, channels_s, channels_t, loss_weight=1.0, device=None, layer_weights=None, ae_weight=0.05):
         super().__init__()
         self.loss_weight = loss_weight
         self.ae_weight = ae_weight

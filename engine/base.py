@@ -671,10 +671,20 @@ class BaseTrainer:
                 ckpt = torch.load(self.teacher_path, map_location="cpu", weights_only=False)
                 # Handle both checkpoint dict {"model": ...} and raw .pt files
                 if isinstance(ckpt, dict):
-                    self.teacher = ckpt.get("model") or ckpt.get("ema")
-                    if self.teacher is None:
+                    if "model" in ckpt or "ema" in ckpt:
+                        # YOLO-style checkpoint
+                        self.teacher = ckpt.get("model") or ckpt.get("ema")
+                    elif "state_dict" in ckpt:
+                        # IRFormer / generic PyTorch checkpoint → khởi tạo model rồi load weights
+                        _m = self.build_teacher_model()
+                        _m.load_state_dict(ckpt["state_dict"], strict=True)
+                        self.teacher = _m
+                        LOGGER.info(
+                            f"{colorstr('Distillation:')} loaded IRFormer via state_dict "
+                        )
+                    else:
                         raise ValueError(
-                            f"Distillation: checkpoint '{self.teacher_path}' has no 'model' or 'ema' key. "
+                            f"Distillation: checkpoint '{self.teacher_path}' has no recognised key. "
                             f"Available keys: {list(ckpt.keys())}"
                         )
                 else:

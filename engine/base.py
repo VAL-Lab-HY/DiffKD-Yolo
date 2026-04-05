@@ -819,7 +819,6 @@ class BaseTrainer:
                                         mode="bilinear",
                                         align_corners=False,
                                     )
-                                    print(f"{distill_trainer._teacher_layer_names}")
                                 else:
                                     # YOLO-to-YOLO: dùng nguyên batch["img"]
                                     teacher_input = batch["img"]

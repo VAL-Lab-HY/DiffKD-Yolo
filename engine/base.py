@@ -64,6 +64,7 @@ class FeatureLoss(nn.Module):
         super().__init__()
         self.loss_weight = loss_weight
         self.ae_weight = ae_weight
+        self.use_ae = True
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -77,8 +78,11 @@ class FeatureLoss(nn.Module):
         else:
             self.layer_weights = layer_weights
 
+        if channels_s[0] < channels_t[0]:
+            self.use_ae = False
+
         self.diffkd = nn.ModuleList([
-            DiffKD(s, t, kernel_size=3, use_ae=True).to(self.device)
+            DiffKD(s, t, kernel_size=3, use_ae=self.use_ae).to(self.device)
             for s, t in zip(channels_s, channels_t)
         ])
 
@@ -174,7 +178,7 @@ class DistillationTrainer:
 
     def _find_layers(self):
         """Tự động chọn phương thức tìm layer."""
-        if self._teacher_layer_names and self._student_layer_names:
+        if self._teacher_layer_names or self._student_layer_names:
             LOGGER.info("DEBUG: Đang tìm layer theo tên (Cross-Architecture)...")
             self._find_layers_by_name()
         else:
@@ -296,33 +300,9 @@ class DistillationTrainer:
                 storage.append(feat)
             return hook
 
-        def _make_logit_hook(storage):
-            """Hook for Detect head — captures raw prediction tensors per scale."""
-            def hook(m, inp, out):
-                # out is a list/tuple of tensors per detection scale
-                if isinstance(out, (list, tuple)):
-                    storage.append([o.detach().clone() for o in out if torch.is_tensor(o)])
-
-                elif isinstance(out, dict):
-                    storage.append({k: v.detach().clone() for k, v in out.items() if torch.is_tensor(v)})
-
-                elif torch.is_tensor(out):
-                    storage.append(out.detach().clone())
-
-                else:
-                    storage.append(out)
-            return hook
-
         for t_mod, s_mod in zip(self.teacher_modules, self.student_modules):
             self._handles.append(t_mod.register_forward_hook(_make_hook(self.teacher_outputs, detach=True)))
             self._handles.append(s_mod.register_forward_hook(_make_hook(self.student_outputs, detach=False)))
-
-    def _find_detect_head(self, model):
-        """Find the Detect head module in a YOLO model."""
-        for name, module in model.named_modules():
-            if type(module).__name__ == "Detect":
-                return module
-        return None
 
     def remove_hooks(self):
         """Remove all registered forward hooks. Call at the end of each epoch."""
@@ -729,23 +709,18 @@ class BaseTrainer:
             for p in self.teacher.parameters():
                 p.requires_grad = False
 
-            # Đọc cross-architecture config từ args nếu có, fallback về YOLO-to-YOLO
-            _t_layer_names = getattr(self.args, "teacher_layer_names", None)  # e.g. ["transformer"]
-            _s_layer_names = getattr(self.args, "student_layer_names", None)  # e.g. ["model.4"]
-            _t_channels    = getattr(self.args, "teacher_channels", None)     # e.g. [16]
-            _s_channels    = getattr(self.args, "student_channels", None)     # e.g. None
-
             distill_trainer = DistillationTrainer(
                 student=unwrap_model(self.model),
                 teacher=self.teacher,
                 device=self.device,
                 num_classes=getattr(unwrap_model(self.model), "nc", 1),
                 reg_max=getattr(getattr(unwrap_model(self.model), "model", None), "reg_max", 16) or 16,
-                teacher_layer_names=_t_layer_names,
-                student_layer_names=_s_layer_names,
-                teacher_channels=_t_channels,
-                student_channels=_s_channels,
+                teacher_layer_names=['transformer.2.ffn.project_out'],
+                student_layer_names=['model.4.m.1.cv2.bn'],
+                teacher_channels=[16],
+                student_channels=[64],
             )
+
             if distill_trainer is not None:
                 # Lấy các tham số cần học của bộ DiffKD (bao gồm Projector và Denoising net)
                 kd_params = list(distill_trainer.loss_fn.diffkd.parameters())
@@ -825,31 +800,24 @@ class BaseTrainer:
 
                         # Distillation loss -----------------------------------
                         if distill_trainer is not None:
-                            # with torch.no_grad():
-                            #     try:
-                            #         if distill_trainer._teacher_layer_names is not None:
-                            #             # Cross-architecture (IRFormer): resize về input size của teacher
-                            #             teacher_input = F.interpolate(
-                            #                 batch["img"],
-                            #                 size=(256, 256),
-                            #                 mode="bilinear",
-                            #                 align_corners=False,
-                            #             )
-                            #             print(f"{distill_trainer._teacher_layer_names}")
-                            #         else:
-                            #             # YOLO-to-YOLO: dùng nguyên batch["img"]
-                            #             teacher_input = batch["img"]
-                            #         self.teacher(teacher_input)
-                            #     except Exception as e:
-                            #         LOGGER.warning(f"Distillation: teacher forward failed ({e}), skipping batch.")
-                            # Thay vì resize 256x256
                             with torch.no_grad():
                                 try:
-                                    # Đối với YOLO-to-YOLO, dùng thẳng batch["img"]
-                                    teacher_input = batch["img"] 
+                                    if distill_trainer._teacher_layer_names is not None:
+                                        # Cross-architecture (IRFormer): resize về input size của teacher
+                                        teacher_input = F.interpolate(
+                                            batch["img"],
+                                            size=(256, 256),
+                                            mode="bilinear",
+                                            align_corners=False,
+                                        )
+                                        print(f"{distill_trainer._teacher_layer_names}")
+                                    else:
+                                        # YOLO-to-YOLO: dùng nguyên batch["img"]
+                                        teacher_input = batch["img"]
                                     self.teacher(teacher_input)
                                 except Exception as e:
                                     LOGGER.warning(f"Distillation: teacher forward failed ({e}), skipping batch.")
+
                             d_loss = distill_trainer.get_loss() * self.kd_loss_weight
                             self.loss = self.loss + d_loss
                         # -----------------------------------------------------

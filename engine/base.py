@@ -811,22 +811,19 @@ class BaseTrainer:
                         # Distillation loss -----------------------------------
                         if distill_trainer is not None:
                             with torch.no_grad():
-                                try:
-                                    if distill_trainer._teacher_layer_names is not None:
-                                        # Cross-architecture (IRFormer): resize về input size của teacher
-                                        teacher_input = F.interpolate(
-                                            batch["img"],
-                                            size=(256, 256),
-                                            mode="bilinear",
-                                            align_corners=False,
-                                        )
-                                        print(f"{distill_trainer._teacher_layer_names}")
-                                    else:
-                                        # YOLO-to-YOLO: dùng nguyên batch["img"]
-                                        teacher_input = batch["img"]
-                                    self.teacher(teacher_input)
-                                except Exception as e:
-                                    LOGGER.warning(f"Distillation: teacher forward failed ({e}), skipping batch.")
+                                if distill_trainer._teacher_layer_names is not None:
+                                    # Cross-architecture (IRFormer): resize về input size của teacher
+                                    teacher_input = F.interpolate(
+                                        batch["img"],
+                                        size=(256, 256),
+                                        mode="bilinear",
+                                        align_corners=False,
+                                    )
+                                    print(f"{distill_trainer._teacher_layer_names}")
+                                else:
+                                    # YOLO-to-YOLO: dùng nguyên batch["img"]
+                                    teacher_input = batch["img"]
+                                self.teacher(teacher_input)
 
                             d_loss = distill_trainer.get_loss() * self.kd_loss_weight
                             self.loss = self.loss + d_loss

@@ -82,7 +82,7 @@ class FeatureLoss(nn.Module):
             self.use_ae = False
 
         self.diffkd = nn.ModuleList([
-            DiffKD(s, t, kernel_size=3, use_ae=self.use_ae).to(self.device)
+            DiffKD(s, t, use_ae=self.use_ae).to(self.device)
             for s, t in zip(channels_s, channels_t)
         ])
 

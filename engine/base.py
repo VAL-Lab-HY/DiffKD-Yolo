@@ -60,10 +60,12 @@ from ultralytics.utils.torch_utils import (
 
 
 class FeatureLoss(nn.Module):
-    def __init__(self, channels_s, channels_t, loss_weight=1.0, device=None, layer_weights=None, ae_weight=0.05):
+    def __init__(self, channels_s, channels_t, loss_weight=1.0, device=None, layer_weights=None, ae_weight=0.05, kd_weight=1.0, ddim_weight=0.1):
         super().__init__()
         self.loss_weight = loss_weight
         self.ae_weight = ae_weight
+        self.kd_weight = kd_weight
+        self.ddim_weight = ddim_weight
         self.use_ae = True
 
         if device is None:
@@ -102,9 +104,11 @@ class FeatureLoss(nn.Module):
                     t, size=s.shape[2:], mode='bilinear', align_corners=False
                 ).detach()
 
-            s_proc, t_proc, kd_loss, ae_loss = self.diffkd[i](s, t.detach())
+            s_proc, t_proc, ddim_loss, ae_loss = self.diffkd[i](s, t.detach())
 
-            loss = kd_loss
+            kd_loss = self.diffkd[i].kd_loss(s_proc, t_proc)
+
+            loss = kd_loss + self.ddim_weight * ddim_loss
 
             if ae_loss is not None:
                 loss += self.ae_weight * ae_loss

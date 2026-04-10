@@ -149,9 +149,6 @@ class DistillationTrainer:
         self._teacher_channels_override = teacher_channels
         self._student_channels_override = student_channels
 
-        # --- DEBUG: KIỂM TRA CẤU TRÚC MODEL TRƯỚC KHI HOOK ---
-        LOGGER.info(f"DEBUG: Khởi tạo Distillation giữa {type(teacher).__name__} và {type(student).__name__}")
-
         # Warm-up (Best effort)
         with torch.no_grad():
             dummy = torch.zeros(1, 3, 640, 640, device=self.device)
@@ -166,13 +163,6 @@ class DistillationTrainer:
         # Tìm layer để hook
         self._find_layers()
 
-        # --- DEBUG: KIỂM TRA SỐ LƯỢNG LAYER ĐÃ HOOK ---
-        if len(self.teacher_modules) == 0:
-            LOGGER.error(f"CRITICAL: Không tìm thấy layer nào để hook với indices: {self.layers}!")
-        else:
-            LOGGER.info(f"DEBUG: Đã hook thành công {len(self.teacher_modules)} cặp layers.")
-            LOGGER.info(f"DEBUG: Channels Student: {self.channels_s} | Channels Teacher: {self.channels_t}")
-
         # Khởi tạo Loss functions
         self.loss_fn = FeatureLoss(
             channels_s=self.channels_s,
@@ -184,10 +174,8 @@ class DistillationTrainer:
     def _find_layers(self):
         """Tự động chọn phương thức tìm layer."""
         if self._teacher_layer_names or self._student_layer_names:
-            LOGGER.info("DEBUG: Đang tìm layer theo tên (Cross-Architecture)...")
             self._find_layers_by_name()
         else:
-            LOGGER.info(f"DEBUG: Đang tìm layer theo CV2 Index: {self.layers} (YOLO-to-YOLO)...")
             self._find_layers_by_cv2()
 
     def _find_layers_by_cv2(self):
@@ -731,9 +719,9 @@ class BaseTrainer:
                 num_classes=getattr(unwrap_model(self.model), "nc", 1),
                 reg_max=getattr(getattr(unwrap_model(self.model), "model", None), "reg_max", 16) or 16,
                 teacher_layer_names=['transformer.2.ffn.project_out'],
-                student_layer_names=['model.4.m.0.cv2.bn'],
+                student_layer_names=['model.4.m.1.cv2.bn'],
                 teacher_channels=[16],
-                student_channels=[64],
+                student_channels=[128],
             )
 
             if distill_trainer is not None:
@@ -748,7 +736,6 @@ class BaseTrainer:
                         "weight_decay": self.args.weight_decay,
                         "param_group": "kd_diffkd"    # Đặt tên để dễ quản lý
                     })
-                    LOGGER.info(f"DEBUG: Đã thêm {len(kd_params)} tham số DiffKD vào Optimizer.")
         # ------------------------------------------------------------------
 
         epoch = self.start_epoch

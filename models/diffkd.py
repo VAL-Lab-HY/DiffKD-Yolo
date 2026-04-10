@@ -3,19 +3,37 @@ from torch import nn
 import torch.nn.functional as F
 
 
-# ============================================================
-# Sub-modules (thay thế các import từ diffkd_modules)
-# ============================================================
+class Bottleneck(nn.Module):
+    def __init__(self, in_channels, out_channels, reduction=4):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // reduction, 1),
+            nn.BatchNorm2d(in_channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // reduction, in_channels // reduction, 3, padding=1),
+            nn.BatchNorm2d(in_channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // reduction, out_channels, 1),
+            nn.BatchNorm2d(out_channels),
+        )
+
+        self.shortcut = (
+            nn.Conv2d(in_channels, out_channels, 1)
+            if in_channels != out_channels
+            else nn.Identity()
+        )
+
+    def forward(self, x):
+        return self.block(x) + self.shortcut(x)
+    
 
 class DiffusionModel(nn.Module):
-    """U-Net nhỏ dự đoán noise, có điều kiện theo timestep."""
+    """Dự đoán noise, có điều kiện theo timestep."""
 
     def __init__(self, channels_in: int, kernel_size: int = 3):
         super().__init__()
-        padding = kernel_size // 2
-        mid = max(channels_in * 2, 64)
 
-        # Timestep embedding → cộng vào feature map
+        # Timestep embedding
         self.time_mlp = nn.Sequential(
             nn.Linear(1, channels_in),
             nn.SiLU(),
@@ -23,66 +41,52 @@ class DiffusionModel(nn.Module):
         )
 
         self.net = nn.Sequential(
-            nn.Conv2d(channels_in, mid, kernel_size, padding=padding),
-            nn.GroupNorm(8, mid),
-            nn.SiLU(),
-            nn.Conv2d(mid, mid, kernel_size, padding=padding),
-            nn.GroupNorm(8, mid),
-            nn.SiLU(),
-            nn.Conv2d(mid, channels_in, kernel_size, padding=padding),
+            Bottleneck(channels_in, channels_in),
+            Bottleneck(channels_in, channels_in),
+            nn.Conv2d(channels_in, channels_in, 1),
+            nn.BatchNorm2d(channels_in),
         )
 
     def forward(self, x: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
-        # timesteps: (B,) long → embed → (B, C, 1, 1)
-        t = timesteps.float().unsqueeze(-1) / 1000.0          # normalise
-        t_emb = self.time_mlp(t).unsqueeze(-1).unsqueeze(-1)  # (B,C,1,1)
+        t = timesteps.float().unsqueeze(-1) / 1000.0
+        t_emb = self.time_mlp(t).unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1)
         return self.net(x + t_emb)
 
 
 class NoiseAdapter(nn.Module):
-    """Ước lượng mức nhiễu phù hợp cho student feature."""
-
-    def __init__(self, channels: int, kernel_size: int = 3):
+    def __init__(self, channels, kernel_size=3):
         super().__init__()
-        padding = kernel_size // 2
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(channels, channels),
-            nn.SiLU(),
-            nn.Linear(channels, 1),
-            nn.Sigmoid(),
-        )
+        self.feat = nn.Sequential(
+            Bottleneck(channels, channels, reduction=8),
+            nn.AdaptiveAvgPool2d(1)
+            )
+        self.pred = nn.Linear(channels, 2)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Trả về scalar noise-level trong [0, 1] cho mỗi sample."""
-        return self.fc(self.pool(x))          # (B, 1)
+    def forward(self, x):
+        x = self.feat(x).flatten(1)
+        x = self.pred(x).softmax(1)[:, 0]
+        return x
 
 
 class AutoEncoder(nn.Module):
-    """Nén teacher feature xuống không gian ẩn rồi reconstruct."""
-
-    def __init__(self, in_channels: int, latent_channels: int):
+    def __init__(self, channels, latent_channels):
         super().__init__()
         self.encoder = nn.Sequential(
-            nn.Conv2d(in_channels, latent_channels, 1),
-            nn.BatchNorm2d(latent_channels),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, latent_channels, 1, padding=0),
+            nn.BatchNorm2d(latent_channels)
         )
         self.decoder = nn.Sequential(
-            nn.Conv2d(latent_channels, in_channels, 1),
-            nn.BatchNorm2d(in_channels),
+            nn.Conv2d(latent_channels, channels, 1, padding=0),
         )
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x):
         hidden = self.encoder(x)
-        rec = self.decoder(hidden)
-        return hidden, rec
+        out = self.decoder(hidden)
+        return hidden, out
 
+    def forward_encoder(self, x):
+        return self.encoder(x)
 
-# ============================================================
-# DDIM Scheduler (thay thế scheduling_ddim)
-# ============================================================
 
 class DDIMScheduler:
     """
@@ -109,13 +113,8 @@ class DDIMScheduler:
         alphas = 1.0 - betas
         self.alphas_cumprod = torch.cumprod(alphas, dim=0)   # ᾱ_t
 
-    # ------ forward process ------
-    def add_noise(
-        self,
-        original: torch.Tensor,
-        noise: torch.Tensor,
-        timesteps: torch.Tensor,
-    ) -> torch.Tensor:
+    # forward process
+    def add_noise(self, original: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor,) -> torch.Tensor:
         acp = self.alphas_cumprod.to(original.device)
         sqrt_alpha = acp[timesteps] ** 0.5
         sqrt_one_minus = (1 - acp[timesteps]) ** 0.5
@@ -128,14 +127,7 @@ class DDIMScheduler:
 
         return expand(sqrt_alpha) * original + expand(sqrt_one_minus) * noise
 
-    # ------ DDIM step (single) ------
-    def step(
-        self,
-        noise_pred: torch.Tensor,
-        t: int,
-        x_t: torch.Tensor,
-        prev_t: int,
-    ) -> torch.Tensor:
+    def step(self, noise_pred: torch.Tensor, t: int, x_t: torch.Tensor, prev_t: int,) -> torch.Tensor:
         acp = self.alphas_cumprod.to(x_t.device)
         alpha_t    = acp[t]
         alpha_prev = acp[prev_t] if prev_t >= 0 else torch.tensor(1.0)
@@ -155,10 +147,6 @@ class DDIMScheduler:
             range(self.num_train_timesteps - 1, -1, -step_size)
         )[:num_inference_steps]
 
-
-# ============================================================
-# DDIM Pipeline
-# ============================================================
 
 class DDIMPipeline:
     """
@@ -210,10 +198,6 @@ class DDIMPipeline:
         return x
 
 
-# ============================================================
-# DiffKD – giữ nguyên cấu trúc bản gốc
-# ============================================================
-
 class DiffKD(nn.Module):
     def __init__(
         self,
@@ -229,17 +213,16 @@ class DiffKD(nn.Module):
         self.use_ae = use_ae
         self.diffusion_inference_steps = inference_steps
 
-        # ---------- AE để nén teacher feature ----------
         if use_ae:
             if ae_channels is None:
                 ae_channels = teacher_channels // 2
             self.ae = AutoEncoder(teacher_channels, ae_channels)
-            teacher_channels = ae_channels          # downstream dùng kích thước này
+            teacher_channels = ae_channels
 
-        # ---------- align student → teacher dim ----------
+        # align student → teacher dim
         self.trans = nn.Conv2d(student_channels, teacher_channels, 1)
 
-        # ---------- diffusion model ----------
+        # diffusion model
         self.model = DiffusionModel(channels_in=teacher_channels, kernel_size=kernel_size)
 
         self.scheduler = DDIMScheduler(
@@ -257,12 +240,11 @@ class DiffKD(nn.Module):
             nn.BatchNorm2d(teacher_channels),
         )
 
-    # ----------------------------------------------------------
     def forward(self, student_feat: torch.Tensor, teacher_feat: torch.Tensor):
         # 1. Align student
         student_feat = self.trans(student_feat)
 
-        # 2. AE trên teacher
+        # 2. Auto encode
         if self.use_ae:
             hidden_t_feat, rec_t_feat = self.ae(teacher_feat)
             rec_loss = F.mse_loss(teacher_feat, rec_t_feat)
@@ -282,12 +264,11 @@ class DiffKD(nn.Module):
         )
         refined_feat = self.proj(refined_feat)
 
-        # 4. Huấn luyện diffusion model
+        # 4. Train diffusion model
         ddim_loss = self.ddim_loss(teacher_feat)
 
         return refined_feat, teacher_feat, ddim_loss, rec_loss
 
-    # ----------------------------------------------------------
     def ddim_loss(self, gt_feat: torch.Tensor) -> torch.Tensor:
         noise = torch.randn_like(gt_feat)
         bs = gt_feat.shape[0]

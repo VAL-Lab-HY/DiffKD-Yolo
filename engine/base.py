@@ -719,9 +719,9 @@ class BaseTrainer:
                 num_classes=getattr(unwrap_model(self.model), "nc", 1),
                 reg_max=getattr(getattr(unwrap_model(self.model), "model", None), "reg_max", 16) or 16,
                 teacher_layer_names=['transformer.2.ffn.project_out'],
-                student_layer_names=['model.4.m.1.cv2.bn'],
+                student_layer_names=['model.6.m.1.cv2.bn'],
                 teacher_channels=[16],
-                student_channels=[64],
+                student_channels=[128],
             )
 
             if distill_trainer is not None:

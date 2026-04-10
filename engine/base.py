@@ -721,7 +721,7 @@ class BaseTrainer:
                 teacher_layer_names=['transformer.2.ffn.project_out'],
                 student_layer_names=['model.4.m.1.cv2.bn'],
                 teacher_channels=[16],
-                student_channels=[128],
+                student_channels=[64],
             )
 
             if distill_trainer is not None:

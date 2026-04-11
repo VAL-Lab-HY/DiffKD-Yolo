@@ -124,7 +124,7 @@ class FeatureLoss(nn.Module):
 
 
 class DistillationTrainer:
-    DEFAULT_LAYERS = ["4"] 
+    DEFAULT_LAYERS = ["6"] 
 
     def __init__(self, student, teacher, layers=None, device=None, layer_weights=None, num_classes=1, reg_max=16,
                 teacher_layer_names=None, student_layer_names=None, teacher_channels=None, student_channels=None):
@@ -697,17 +697,7 @@ class BaseTrainer:
                         self.teacher = self.teacher.model
                     else:
                         break
-                LOGGER.info(
-                    f"{colorstr('Distillation:')} teacher resolved to "
-                    f"{type(self.teacher).__name__} "
-                    f"(cv2 layers: {sum(1 for n,_ in self.teacher.named_modules() if 'cv2' in n)})"
-                )
 
-            LOGGER.info(
-                f"{colorstr('Distillation:')} enabled | "
-                f"teacher={type(self.teacher).__name__} | "
-                f"student device={self.device}"
-            )
             self.teacher = self.teacher.to(self.device).eval()
             for p in self.teacher.parameters():
                 p.requires_grad = False
@@ -719,9 +709,9 @@ class BaseTrainer:
                 num_classes=getattr(unwrap_model(self.model), "nc", 1),
                 reg_max=getattr(getattr(unwrap_model(self.model), "model", None), "reg_max", 16) or 16,
                 teacher_layer_names=['transformer.2.ffn.project_out'],
-                student_layer_names=['model.6.m.1.cv2.bn'],
+                student_layer_names=['model.2.m.0.cv2.bn'],
                 teacher_channels=[16],
-                student_channels=[128],
+                student_channels=[32],
             )
 
             if distill_trainer is not None:

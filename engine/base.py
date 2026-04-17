@@ -60,41 +60,26 @@ from ultralytics.utils.torch_utils import (
 
 
 class FeatureLoss(nn.Module):
-    def __init__(self, channels_s, channels_t, loss_weight=1.0, device=None, layer_weights=None, ae_weight=0.05):
+    def __init__(self, channels_s, channels_t, device=None, kd_weight=1.0):
         super().__init__()
-        self.loss_weight = loss_weight
-        self.ae_weight = ae_weight
-        self.use_ae = True
+        self.kd_weight = kd_weight
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
 
-        # layer weights
-        if layer_weights is None:
-            n = len(channels_s)
-            denom = max(n - 1, 1)
-            self.layer_weights = [0.5 + 1.5 * i / denom for i in range(n)]
-        else:
-            self.layer_weights = layer_weights
-
-        if channels_s[0] < channels_t[0]:
-            self.use_ae = False
-
         self.diffkd = nn.ModuleList([
-            DiffKD(s, t, use_ae=self.use_ae).to(self.device)
+            DiffKD(s, t).to(self.device)
             for s, t in zip(channels_s, channels_t)
         ])
 
-    def forward(self, y_s, y_t):
-        if len(y_s) == 0 or len(y_t) == 0:
-            return torch.tensor(0.0, device=self.device, requires_grad=True)
+        self.kd_loss = nn.MSELoss()
 
+    def forward(self, y_s, y_t):
         if len(y_s) != len(y_t):
             y_t = y_t[-len(y_s):]
 
         total_loss = 0.0
-        total_weight = sum(self.layer_weights)
 
         for i, (s, t) in enumerate(zip(y_s, y_t)):
             if s.shape[2:] != t.shape[2:]:
@@ -102,27 +87,26 @@ class FeatureLoss(nn.Module):
                     t, size=s.shape[2:], mode='bilinear', align_corners=False
                 ).detach()
 
-            s_proc, t_proc, kd_loss, ae_loss = self.diffkd[i](s, t.detach())
+            s_proc, t_proc, diff_loss = self.diffkd[i](s, t.detach())
 
-            loss = kd_loss
+            kd_loss = self.kd_loss(s_proc, t_proc.detach())
 
-            if ae_loss is not None:
-                loss += self.ae_weight * ae_loss
+            loss = self.kd_weight * kd_loss + diff_loss
 
             if not torch.isfinite(loss):
                 LOGGER.warning(f"layer {i} NaN → zero")
                 loss = torch.zeros_like(loss)
 
-            total_loss += loss * self.layer_weights[i]
+            total_loss += loss
 
-        return self.loss_weight * (total_loss / total_weight)
+        return total_loss
 
 
 class DistillationTrainer:
-    DEFAULT_LAYERS = ["4"] 
+    DEFAULT_LAYERS = ["6"] 
 
-    def __init__(self, student, teacher, layers=None, device=None, layer_weights=None, num_classes=1, reg_max=16,
-                teacher_layer_names=None, student_layer_names=None, teacher_channels=None, student_channels=None):
+    def __init__(self, student, teacher, layers=None, device=None, num_classes=1, teacher_layer_names=None,
+                student_layer_names=None, teacher_channels=None, student_channels=None):
         
         self.layers = layers or self.DEFAULT_LAYERS
         self.student = student
@@ -144,9 +128,6 @@ class DistillationTrainer:
         self._teacher_channels_override = teacher_channels
         self._student_channels_override = student_channels
 
-        # --- DEBUG: KIỂM TRA CẤU TRÚC MODEL TRƯỚC KHI HOOK ---
-        LOGGER.info(f"DEBUG: Khởi tạo Distillation giữa {type(teacher).__name__} và {type(student).__name__}")
-
         # Warm-up (Best effort)
         with torch.no_grad():
             dummy = torch.zeros(1, 3, 640, 640, device=self.device)
@@ -161,28 +142,18 @@ class DistillationTrainer:
         # Tìm layer để hook
         self._find_layers()
 
-        # --- DEBUG: KIỂM TRA SỐ LƯỢNG LAYER ĐÃ HOOK ---
-        if len(self.teacher_modules) == 0:
-            LOGGER.error(f"CRITICAL: Không tìm thấy layer nào để hook với indices: {self.layers}!")
-        else:
-            LOGGER.info(f"DEBUG: Đã hook thành công {len(self.teacher_modules)} cặp layers.")
-            LOGGER.info(f"DEBUG: Channels Student: {self.channels_s} | Channels Teacher: {self.channels_t}")
-
         # Khởi tạo Loss functions
         self.loss_fn = FeatureLoss(
             channels_s=self.channels_s,
             channels_t=self.channels_t,
-            layer_weights=layer_weights,
             device=self.device,
         ).to(self.device)
 
     def _find_layers(self):
         """Tự động chọn phương thức tìm layer."""
         if self._teacher_layer_names or self._student_layer_names:
-            LOGGER.info("DEBUG: Đang tìm layer theo tên (Cross-Architecture)...")
             self._find_layers_by_name()
         else:
-            LOGGER.info(f"DEBUG: Đang tìm layer theo CV2 Index: {self.layers} (YOLO-to-YOLO)...")
             self._find_layers_by_cv2()
 
     def _find_layers_by_cv2(self):
@@ -704,17 +675,7 @@ class BaseTrainer:
                         self.teacher = self.teacher.model
                     else:
                         break
-                LOGGER.info(
-                    f"{colorstr('Distillation:')} teacher resolved to "
-                    f"{type(self.teacher).__name__} "
-                    f"(cv2 layers: {sum(1 for n,_ in self.teacher.named_modules() if 'cv2' in n)})"
-                )
 
-            LOGGER.info(
-                f"{colorstr('Distillation:')} enabled | "
-                f"teacher={type(self.teacher).__name__} | "
-                f"student device={self.device}"
-            )
             self.teacher = self.teacher.to(self.device).eval()
             for p in self.teacher.parameters():
                 p.requires_grad = False
@@ -724,11 +685,14 @@ class BaseTrainer:
                 teacher=self.teacher,
                 device=self.device,
                 num_classes=getattr(unwrap_model(self.model), "nc", 1),
-                reg_max=getattr(getattr(unwrap_model(self.model), "model", None), "reg_max", 16) or 16,
-                teacher_layer_names=['transformer.2.ffn.project_out'],
-                student_layer_names=['model.4.m.0.cv2.bn'],
-                teacher_channels=[16],
-                student_channels=[64],
+                # teacher_layer_names=['transformer.2.ffn.project_out'],
+                # student_layer_names=['model.6.m.1.cv2.bn'],
+                # teacher_channels=[16],
+                # student_channels=[128],
+                teacher_layer_names=None,
+                student_layer_names=None,
+                teacher_channels=None,
+                student_channels=None,
             )
 
             if distill_trainer is not None:
@@ -743,7 +707,6 @@ class BaseTrainer:
                         "weight_decay": self.args.weight_decay,
                         "param_group": "kd_diffkd"    # Đặt tên để dễ quản lý
                     })
-                    LOGGER.info(f"DEBUG: Đã thêm {len(kd_params)} tham số DiffKD vào Optimizer.")
         # ------------------------------------------------------------------
 
         epoch = self.start_epoch

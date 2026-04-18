@@ -29,11 +29,7 @@ class Bottleneck(nn.Module):
 class DiffusionModel(nn.Module):
     def __init__(self, channels_in: int, kernel_size: int = 3):
         super().__init__()
-        self.time_mlp = nn.Sequential(
-            nn.Linear(1, channels_in),
-            nn.SiLU(),
-            nn.Linear(channels_in, channels_in),
-        )
+        self.time_embedding = nn.Embedding(1280, channels_in)
         self.net = nn.Sequential(
             Bottleneck(channels_in, channels_in),
             Bottleneck(channels_in, channels_in),
@@ -41,28 +37,30 @@ class DiffusionModel(nn.Module):
             nn.BatchNorm2d(channels_in),
         )
 
-    def forward(self, x: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
-        t = timesteps.float().unsqueeze(-1) / 1000.0
-        t_emb = self.time_mlp(t).unsqueeze(-1).unsqueeze(-1)
-        return self.net(x + t_emb)
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if t.dtype != torch.long:
+            t = t.long()
+        if t.dim() == 0:
+            t = t.unsqueeze(0).expand(x.shape[0])
+        feat = x + self.time_embedding(t)[..., None, None]
+        return self.net(feat)
 
 
 class NoiseAdapter(nn.Module):
-    def __init__(self, channels, kernel_size=3, num_train_timesteps=500):
+    """Dự đoán alpha_prod — mức signal cần giữ lại khi add noise vào student feature."""
+    def __init__(self, channels, kernel_size=3):
         super().__init__()
-        self.num_train_timesteps = num_train_timesteps
-
         self.feat = nn.Sequential(
             Bottleneck(channels, channels, reduction=8),
             nn.AdaptiveAvgPool2d(1),
         )
+
         self.pred = nn.Linear(channels, 2)
 
     def forward(self, x):
-        x = self.feat(x).flatten(1)
-        t = torch.sigmoid(self.pred(x))      
-        t = (t * self.num_train_timesteps - 1).long().squeeze(1) 
-        return t
+        x = self.feat(x).flatten(1)        # (B, C)
+        x = self.pred(x).softmax(1)[:, 0]  # (B,) alpha_prod trong (0,1)
+        return x
 
 
 class AutoEncoder(nn.Module):
@@ -93,9 +91,16 @@ class DDIMScheduler:
         self.alphas_cumprod = torch.cumprod(alphas, dim=0)
 
     def add_noise(self, x0, noise, timesteps):
+        """Dùng trong ddim_loss — timesteps là long index (B,)."""
         acp = self.alphas_cumprod.to(x0.device)
         alpha_bar = acp[timesteps].view(-1, 1, 1, 1)
         return torch.sqrt(alpha_bar) * x0 + torch.sqrt(1 - alpha_bar) * noise
+
+    def add_noise_diff2(self, x0, noise, alpha_prod):
+        """Dùng trong pipeline — alpha_prod là float (B,) từ NoiseAdapter."""
+        sqrt_alpha = alpha_prod.view(-1, 1, 1, 1)
+        sqrt_one_minus = (1 - alpha_prod).view(-1, 1, 1, 1)
+        return sqrt_alpha * x0 + sqrt_one_minus * noise
 
     def step(self, noise_pred, t, x_t, t_prev):
         acp = self.alphas_cumprod.to(x_t.device)
@@ -108,17 +113,6 @@ class DDIMScheduler:
     def set_timesteps(self, num_inference_steps):
         step = self.num_train_timesteps // num_inference_steps
         self.timesteps = list(range(self.num_train_timesteps - 1, -1, -step))[:num_inference_steps]
-        
-    def add_noise_diff2(self, x0, noise, timesteps):
-        print(f"x0: {x0.shape}, noise: {noise.shape}, timesteps: {timesteps.shape}")
-
-        assert timesteps.shape[0] == x0.shape[0], \
-            f"batch mismatch: timesteps {timesteps.shape} vs x0 {x0.shape}"
-        
-        acp = self.alphas_cumprod.to(x0.device)
-        timesteps = timesteps.clamp(0, len(acp) - 1).long()
-        alpha_bar = acp[timesteps].view(-1, 1, 1, 1) 
-        return torch.sqrt(alpha_bar) * x0 + torch.sqrt(1 - alpha_bar) * noise
 
 
 class DDIMPipeline:
@@ -132,15 +126,23 @@ class DDIMPipeline:
         noise = torch.randn((batch_size, *shape), device=device, dtype=dtype)
 
         if self.noise_adapter is not None:
-            timesteps = self.noise_adapter(feat)
-            image = self.scheduler.add_noise_diff2(feat, noise, timesteps)
+            # alpha_prod: (B,) float — add noise theo bản gốc
+            alpha_prod = self.noise_adapter(feat)
+            image = self.scheduler.add_noise_diff2(feat, noise, alpha_prod)
         else:
             image = feat
 
+        # Set timesteps gấp đôi, chỉ chạy nửa sau như bản gốc
         self.scheduler.set_timesteps(num_inference_steps * 2)
-        for t in self.scheduler.timesteps[len(self.scheduler.timesteps) // 2:]:
-            noise_pred = self.model(image, t.to(device))
-            image = self.scheduler.step(noise_pred, t, image)
+        timesteps = self.scheduler.timesteps
+        half = len(timesteps) // 2
+
+        for i, t in enumerate(timesteps[half:]):
+            t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            noise_pred = self.model(image, t_tensor)
+            idx = half + i
+            t_prev = timesteps[idx + 1] if idx + 1 < len(timesteps) else -1
+            image = self.scheduler.step(noise_pred, t, image, t_prev)
 
         if proj is not None:
             image = proj(image)
@@ -196,9 +198,9 @@ class DiffKD(nn.Module):
             shape=student_feat.shape[1:],
             feat=student_feat,
             num_inference_steps=self.diffusion_inference_steps,
-            proj=None,  # FIX Bug 1: không truyền proj vào pipeline
+            proj=None,  # apply proj một lần duy nhất bên dưới
         )
-        refined_feat = self.proj(refined_feat)  # apply đúng 1 lần
+        refined_feat = self.proj(refined_feat)
 
         # 4. Train diffusion model
         ddim_loss = self.ddim_loss(teacher_feat)

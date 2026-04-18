@@ -48,7 +48,7 @@ class DiffusionModel(nn.Module):
 
 
 class NoiseAdapter(nn.Module):
-    def __init__(self, channels, kernel_size=3):
+    def __init__(self, channels, kernel_size=3, num_train_timesteps=500):
         super().__init__()
         self.feat = nn.Sequential(
             Bottleneck(channels, channels, reduction=8),
@@ -58,8 +58,9 @@ class NoiseAdapter(nn.Module):
 
     def forward(self, x):
         x = self.feat(x).flatten(1)
-        x = self.pred(x).softmax(1)[:, 0]
-        return x
+        t = torch.sigmoid(self.pred(x))      
+        t = (t * self.num_train_timesteps).long().squeeze(1) 
+        return t
 
 
 class AutoEncoder(nn.Module):

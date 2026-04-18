@@ -153,7 +153,7 @@ class DDIMPipeline:
 
         if self.noise_adapter is not None:
             nl = self.noise_adapter(feat).view(batch_size, 1, 1, 1)
-            x = torch.sqrt(1 - nl) * feat + torch.sqrt(nl) * noise
+            nl = nl.clamp(0.05, 0.5)
         else:
             # fallback
             x = feat

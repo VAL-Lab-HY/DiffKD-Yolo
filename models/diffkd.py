@@ -50,6 +50,8 @@ class DiffusionModel(nn.Module):
 class NoiseAdapter(nn.Module):
     def __init__(self, channels, kernel_size=3, num_train_timesteps=500):
         super().__init__()
+        self.num_train_timesteps = num_train_timesteps
+        
         self.feat = nn.Sequential(
             Bottleneck(channels, channels, reduction=8),
             nn.AdaptiveAvgPool2d(1),

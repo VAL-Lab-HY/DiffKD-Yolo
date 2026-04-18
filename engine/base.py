@@ -69,11 +69,13 @@ class FeatureLoss(nn.Module):
         self.device = torch.device(device)
 
         self.diffkd = nn.ModuleList([
-            DiffKD(s, t).to(self.device)
+            DiffKD(
+                student_channels=s,
+                teacher_channels=t,
+                use_ae=(t > s),
+            ).to(self.device)
             for s, t in zip(channels_s, channels_t)
         ])
-
-        self.kd_loss = nn.MSELoss()
 
     def forward(self, y_s, y_t):
         if len(y_s) != len(y_t):
@@ -85,13 +87,13 @@ class FeatureLoss(nn.Module):
             if s.shape[2:] != t.shape[2:]:
                 t = F.interpolate(
                     t, size=s.shape[2:], mode='bilinear', align_corners=False
-                ).detach()
+                )
 
-            s_proc, t_proc, diff_loss = self.diffkd[i](s, t.detach())
+            s_proc, t_proc, kd_loss, ae_loss = self.diffkd[i](s, t.detach())
 
-            kd_loss = self.kd_loss(s_proc, t_proc.detach())
-
-            loss = self.kd_weight * kd_loss + diff_loss
+            loss = self.kd_weight * kd_loss
+            if ae_loss is not None:
+                loss = loss + ae_loss
 
             if not torch.isfinite(loss):
                 LOGGER.warning(f"layer {i} NaN → zero")

@@ -110,6 +110,8 @@ class DDIMScheduler:
         self.timesteps = list(range(self.num_train_timesteps - 1, -1, -step))[:num_inference_steps]
         
     def add_noise_diff2(self, x0, noise, timesteps):
+        print(f"x0: {x0.shape}, noise: {noise.shape}, timesteps: {timesteps.shape}")
+
         assert timesteps.shape[0] == x0.shape[0], \
             f"batch mismatch: timesteps {timesteps.shape} vs x0 {x0.shape}"
         

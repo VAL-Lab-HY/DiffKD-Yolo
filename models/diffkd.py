@@ -126,13 +126,11 @@ class DDIMPipeline:
         noise = torch.randn((batch_size, *shape), device=device, dtype=dtype)
 
         if self.noise_adapter is not None:
-            # alpha_prod: (B,) float — add noise theo bản gốc
             alpha_prod = self.noise_adapter(feat)
             image = self.scheduler.add_noise_diff2(feat, noise, alpha_prod)
         else:
             image = feat
 
-        # Set timesteps gấp đôi, chỉ chạy nửa sau như bản gốc
         self.scheduler.set_timesteps(num_inference_steps * 2)
         timesteps = self.scheduler.timesteps
         half = len(timesteps) // 2

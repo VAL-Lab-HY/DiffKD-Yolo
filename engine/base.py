@@ -687,14 +687,10 @@ class BaseTrainer:
                 teacher=self.teacher,
                 device=self.device,
                 num_classes=getattr(unwrap_model(self.model), "nc", 1),
-                # teacher_layer_names=['transformer.2.ffn.project_out'],
-                # student_layer_names=['model.6.m.1.cv2.bn'],
-                # teacher_channels=[16],
-                # student_channels=[128],
-                teacher_layer_names=None,
-                student_layer_names=None,
-                teacher_channels=None,
-                student_channels=None,
+                teacher_layer_names=['transformer.2.ffn.project_out'],
+                student_layer_names=['model.6.m.1.cv2.bn'],
+                teacher_channels=[16],
+                student_channels=[128],
             )
 
             if distill_trainer is not None:

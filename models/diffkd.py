@@ -51,7 +51,7 @@ class NoiseAdapter(nn.Module):
     def __init__(self, channels, kernel_size=3, num_train_timesteps=500):
         super().__init__()
         self.num_train_timesteps = num_train_timesteps
-        
+
         self.feat = nn.Sequential(
             Bottleneck(channels, channels, reduction=8),
             nn.AdaptiveAvgPool2d(1),
@@ -61,7 +61,7 @@ class NoiseAdapter(nn.Module):
     def forward(self, x):
         x = self.feat(x).flatten(1)
         t = torch.sigmoid(self.pred(x))      
-        t = (t * self.num_train_timesteps).long().squeeze(1) 
+        t = (t * self.num_train_timesteps - 1).long().squeeze(1) 
         return t
 
 
@@ -108,11 +108,14 @@ class DDIMScheduler:
     def set_timesteps(self, num_inference_steps):
         step = self.num_train_timesteps // num_inference_steps
         self.timesteps = list(range(self.num_train_timesteps - 1, -1, -step))[:num_inference_steps]
-    
+        
     def add_noise_diff2(self, x0, noise, timesteps):
+        assert timesteps.shape[0] == x0.shape[0], \
+            f"batch mismatch: timesteps {timesteps.shape} vs x0 {x0.shape}"
+        
         acp = self.alphas_cumprod.to(x0.device)
-        timesteps = timesteps.clamp(0, len(acp) - 1)
-        alpha_bar = acp[timesteps].view(-1, 1, 1, 1)
+        timesteps = timesteps.clamp(0, len(acp) - 1).long()
+        alpha_bar = acp[timesteps].view(-1, 1, 1, 1) 
         return torch.sqrt(alpha_bar) * x0 + torch.sqrt(1 - alpha_bar) * noise
 
 

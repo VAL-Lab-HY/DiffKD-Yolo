@@ -105,39 +105,39 @@ class DDIMScheduler:
     def set_timesteps(self, num_inference_steps):
         step = self.num_train_timesteps // num_inference_steps
         self.timesteps = list(range(self.num_train_timesteps - 1, -1, -step))[:num_inference_steps]
+    
+    def add_noise_diff2(self, x0, noise, timesteps):
+        acp = self.alphas_cumprod.to(x0.device)
+        timesteps = timesteps.clamp(0, len(acp) - 1)
+        alpha_bar = acp[timesteps].view(-1, 1, 1, 1)
+        return torch.sqrt(alpha_bar) * x0 + torch.sqrt(1 - alpha_bar) * noise
 
 
 class DDIMPipeline:
-    def __init__(self, model: DiffusionModel, scheduler: DDIMScheduler,
-                 noise_adapter: NoiseAdapter = None):
+    def __init__(self, model, scheduler, noise_adapter=None):
         self.model = model
         self.scheduler = scheduler
         self.noise_adapter = noise_adapter
 
-    @torch.no_grad()
     def __call__(self, batch_size, device, dtype, shape, feat,
                  num_inference_steps=5, proj=None):
-        self.scheduler.set_timesteps(num_inference_steps)
-        timesteps = self.scheduler.timesteps
         noise = torch.randn((batch_size, *shape), device=device, dtype=dtype)
 
         if self.noise_adapter is not None:
-            nl = self.noise_adapter(feat).view(batch_size, 1, 1, 1)
-            nl = nl.clamp(0.05, 0.5)
-            x = torch.sqrt(1 - nl) * feat + torch.sqrt(nl) * noise
+            timesteps = self.noise_adapter(feat)
+            image = self.scheduler.add_noise_diff2(feat, noise, timesteps)
         else:
-            x = feat  # fallback
+            image = feat
 
-        for i, t in enumerate(timesteps):
-            t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
-            noise_pred = self.model(x, t_tensor)
-            prev_t = timesteps[i + 1] if i + 1 < len(timesteps) else -1
-            x = self.scheduler.step(noise_pred, t, x, prev_t)
+        self.scheduler.set_timesteps(num_inference_steps * 2)
+        for t in self.scheduler.timesteps[len(self.scheduler.timesteps) // 2:]:
+            noise_pred = self.model(image, t.to(device))
+            image = self.scheduler.step(noise_pred, t, image)
 
         if proj is not None:
-            x = proj(x)
+            image = proj(image)
 
-        return x
+        return image
 
 
 class DiffKD(nn.Module):

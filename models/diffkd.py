@@ -196,7 +196,7 @@ class DiffKD(nn.Module):
             shape=student_feat.shape[1:],
             feat=student_feat,
             num_inference_steps=self.diffusion_inference_steps,
-            proj=None,  # apply proj một lần duy nhất bên dưới
+            proj=None,
         )
         refined_feat = self.proj(refined_feat)
 
@@ -209,9 +209,7 @@ class DiffKD(nn.Module):
     def ddim_loss(self, gt_feat: torch.Tensor) -> torch.Tensor:
         noise = torch.randn_like(gt_feat)
         bs = gt_feat.shape[0]
-        timesteps = torch.randint(
-            0, self.scheduler.num_train_timesteps, (bs,), device=gt_feat.device
-        ).long()
+        timesteps = torch.randint(0, self.scheduler.num_train_timesteps, (bs,), device=gt_feat.device).long()
         noisy = self.scheduler.add_noise(gt_feat, noise, timesteps)
         noise_pred = self.model(noisy, timesteps)
         return F.mse_loss(noise_pred, noise)

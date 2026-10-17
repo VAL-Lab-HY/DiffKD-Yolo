@@ -1,0 +1,42 @@
+# Retinexformer (LOL-v2-real) teacher at 320x320 → YOLOv10s student (imgsz 640), DiffKD on P2 / P3 / P5.
+# At 320 the teacher maps match P2 / P3 exactly (no feature resizing); P5 is a 4x antialiased downsample.
+
+student:
+  model: yolov10s.pt
+
+teacher:
+  type: retinexformer                       # key in models/teachers/__init__.py:TEACHERS
+  checkpoint: pretrained/LOL_v2_real.pth    # BasicSR checkpoint (key "params")
+  input_size: 320                           # teacher input resized to (S, S); must be divisible by 4
+  args:                                     # = Retinexformer/Options/RetinexFormer_LOL_v2_real.yml
+    in_channels: 3
+    out_channels: 3
+    n_feat: 40
+    stage: 1
+    num_blocks: [1, 2, 2]
+
+distill:
+  loss_weight: 0.1
+  # teacher_channels / student_channels are optional: omitted → inferred from the hooked module.
+  layers:
+    - teacher: body.0.denoiser.decoder_layers.0.2   # 80 ch, 160x160
+      student: model.2.cv2.bn                       # P2, 160x160
+      teacher_channels: 80
+      weight: 1.0
+    - teacher: body.0.denoiser.bottleneck           # 160 ch, 80x80
+      student: model.4.cv2.bn                       # P3, 80x80
+      teacher_channels: 160
+      weight: 1.25
+    - teacher: body.0.denoiser.bottleneck           # 160 ch, 80x80 → 20x20
+      student: model.8.cv2.bn                       # P5, 20x20
+      teacher_channels: 160
+      weight: 1.5
+
+# Passed verbatim to Ultralytics as training overrides.
+train:
+  data: data/coco.yaml
+  epochs: 50
+  batch: 16
+  imgsz: 640
+  project: experiments/runs
+  name: retinexformer_yolov10s_320

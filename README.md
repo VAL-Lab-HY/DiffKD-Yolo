@@ -1,13 +1,13 @@
 # DiffKD-Yolo
 
-DiffKD-Yolo is a **knowledge distillation (KD)** project for **object detection** built on the **Ultralytics YOLO** ecosystem. It uses a **teacher model** and a **student model** to improve the student through **feature distillation** with the **DiffKD** module.
+DiffKD-Yolo is a **knowledge distillation (KD)** project for **low-light object detection** built on the **Ultralytics YOLO** ecosystem. A frozen **low-light image enhancement (LLIE) teacher** (default: Retinexformer) guides a **YOLO student** through **feature distillation** with the **DiffKD** module.
 
 ## Overview
 
 Main training pipeline:
 
 1. Load the **YOLO student** from a checkpoint or default configuration.
-2. Load the **teacher model** from a checkpoint.
+2. Build the **teacher** from the config and load its checkpoint (frozen).
 3. Hook feature layers between the teacher and the student.
 4. Compute **feature loss** with `DiffKD` to bring the student closer to the teacher.
 5. Train the detector using the custom trainer in `engine/`.
@@ -15,60 +15,62 @@ Main training pipeline:
 ## Features
 
 - Detection training with **knowledge distillation**.
-- Feature hooking between teacher and student.
-- Integrated **DiffKD** module in `models/diffkd.py`.
-- Support for different teacher architectures with hook adjustments.
+- All experiment settings (teacher, hooked layers, loss weights, training) in one YAML config.
+- Self-contained teacher implementations in `models/teachers/` (no external repo imports).
+- Integrated **DiffKD** module in `models/modules/diffkd.py`.
 - Compatible with the **Ultralytics** training workflow.
 
 ## Project Structure
 
 ```text
 DiffKD-Yolo/
-├── train.py                # Training entry point
-├── config.yaml             # Config file (currently empty)
+├── configs/
+│   └── distill/
+│       └── retinexformer_yolov10s.yaml   # Experiment config
 ├── engine/
-│   ├── base.py             # Base trainer + distillation logic
-│   └── trainer.py          # Custom DetectionTrainer
+│   ├── distill.py                        # Feature hooks + DiffKD feature loss
+│   └── trainer.py                        # Custom DetectionTrainer
 ├── models/
-│   ├── diffkd.py           # DiffKD module
-│   ├── irformer.py         # IRFormer teacher model
-│   └── mbllen.py           # MBLLEN teacher model
-├── dataset/                # Data
+│   ├── modules/
+│   │   ├── diffkd.py                     # DiffKD module
+│   │   └── lce.py                        # Light Condition Encoder (from Salience-DETR)
+│   └── teachers/
+│       ├── __init__.py                   # Teacher registry: build_teacher(type, **args)
+│       ├── retinexformer.py              # Retinexformer (ICCV 2023)
+│       ├── irformer.py                   # IRFormer
+│       └── mbllen.py                     # MBLLEN
+├── tools/
+│   ├── train.py                          # Training entry point
+│   └── inspect_model.py                  # Print module names / output channels
+├── utils/
+│   └── config.py                         # YAML loading + CLI overrides
+├── pretrained/                           # Teacher checkpoints (not tracked)
+├── data/                                 # Dataset configs / data
 └── experiments/
-    ├── checkpoints/        # Saved checkpoints
-    └── logs/               # Training logs
+    └── runs/                             # Training outputs (not tracked)
 ```
-
-## Outputs
-
-During training, outputs are usually saved in:
-
-- `experiments/checkpoints/`
-- `experiments/logs/`
-
 
 ## Requirements
 
 - Python 3.10+ recommended
 - PyTorch
 - Ultralytics
-- NumPy
+- NumPy, PyYAML
+- einops (only for the IRFormer teacher)
 
 If you are using CUDA, install the PyTorch build that matches your GPU and driver setup.
 
 ## Installation
 
 ```bash
-pip install ultralytics torch torchvision numpy einops
+pip install ultralytics torch torchvision numpy pyyaml einops
 ```
 
-If you already have a virtual environment, activate it before installing dependencies.
+Download the Retinexformer LOL-v2-real checkpoint from the [official repo](https://github.com/caiyuanhao1998/Retinexformer) and place it at `pretrained/LOL_v2_real.pth`.
 
 ## Dataset Setup
 
-The project uses a dataset config file in the Ultralytics format, for example `data/coco.yaml`.
-
-You can replace it with your own YAML file:
+The dataset config uses the Ultralytics format, set via `train.data` in the experiment config:
 
 ```yaml
 path: /path/to/dataset
@@ -80,36 +82,40 @@ names: ["class_name"]
 
 ## Training
 
-Basic training command:
+Run from the repository root:
 
 ```bash
-python train.py --teacher /path/to/teacher.pt --model yolov10s.pt --data data/coco.yaml --epochs 50 --batch 16
+python tools/train.py configs/distill/retinexformer_yolov10s.yaml
 ```
 
-### Command-line arguments
+Override any config entry with dotted `key=value` pairs:
 
-- `--teacher`: path to the teacher checkpoint, required.
-- `--model`: student checkpoint, default `yolov10s.pt`.
-- `--data`: dataset config file, default `data/coco.yaml`.
-- `--epochs`: number of training epochs, default `50`.
-- `--batch`: batch size, default `16`.
+```bash
+python tools/train.py configs/distill/retinexformer_yolov10s.yaml --opts train.epochs=100 train.batch=8 distill.loss_weight=0.2
+```
 
-## Important Notes
+The resolved config is saved to `<save_dir>/config.yaml` for reproducibility.
 
-- `engine/base.py` contains the main distillation logic.
-- `engine/trainer.py` hooks features by default layer index or by module name, depending on the configuration.
-- `models/diffkd.py` defines the diffusion pipeline used for feature distillation.
-- `models/mbllen.py` is the default teacher in `build_teacher_model()`.
-- If you want to use another teacher such as `IRFormer`, update `build_teacher_model()` and adjust the hook layers if needed.
+## Configuration
 
-## Teacher/Student Configuration
+| Section | Description |
+|---|---|
+| `student.model` | Student checkpoint or YAML (e.g. `yolov10s.pt`) |
+| `teacher.type` | Key in `models/teachers/__init__.py:TEACHERS` |
+| `teacher.checkpoint` | Teacher weights (BasicSR `params`, `state_dict`, raw state dict, or Ultralytics checkpoint) |
+| `teacher.input_size` | Teacher input is resized to `(S, S)`; omit to feed the student-sized batch |
+| `teacher.args` | Constructor arguments of the teacher |
+| `distill.loss_weight` | Global weight of the KD loss |
+| `distill.layers` | List of `{teacher, student, teacher_channels?, student_channels?, weight}` hook pairs |
+| `train` | Passed verbatim to Ultralytics (`data`, `epochs`, `batch`, `imgsz`, `project`, `name`, ...) |
 
-In `engine/base.py`, the `DistillationTrainer` class supports:
+Use `tools/inspect_model.py` to find module names and channels when choosing `distill.layers`:
 
-- custom layer-name hooking
-- Ultralytics default-structure hooking
-- feature transfer between teacher and student for distillation loss computation
+```bash
+python tools/inspect_model.py --model yolov10s.pt --filter model.4
+```
 
+To add a teacher, put its implementation in `models/teachers/` and register it in `TEACHERS`.
 
 ## Author
 

@@ -1,0 +1,10 @@
+__pycache__
+.DS_Store
+
+# Pretrained weights
+pretrained/*
+!pretrained/.gitkeep
+
+# Training runs
+experiments/runs/
+

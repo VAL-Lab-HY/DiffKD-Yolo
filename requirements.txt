@@ -1,0 +1,12 @@
+# Install PyTorch matching your CUDA first, e.g.:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch>=1.11          # F.interpolate(antialias=True)
+torchvision
+
+# engine/trainer.py relies on Ultralytics internals (override_configs, _build_train_pipeline,
+# _handle_nan_recovery) that change between releases: pin to the version used on the training machine.
+ultralytics
+
+numpy
+pyyaml
+einops               # IRFormer teacher only

@@ -26,6 +26,7 @@ from ultralytics.utils.plotting import plot_images, plot_labels
 from ultralytics.utils.torch_utils import autocast, torch_distributed_zero_first, unwrap_model
 
 from engine.distill import DistillationTrainer
+from models.modules.lce import attach_lce, darkness_loss, find_lce
 from models.teachers import build_teacher
 
 
@@ -40,6 +41,12 @@ class DetectionTrainer(BaseTrainer):
         distill_cfg = overrides.pop("distill", None) or {}
         self.kd_loss_weight = distill_cfg.get("loss_weight", 0.1)
         self.kd_layers = distill_cfg.get("layers") or []
+        self.kd_darkness_weight = distill_cfg.get("darkness_weight", False)
+        # Light Condition Encoder inside the student (see models/modules/lce.py:attach_lce)
+        self.lce_cfg = dict(overrides.pop("lce", None) or {})
+        self.lce_loss_weight = self.lce_cfg.pop("loss_weight", 1.0)
+        if self.kd_darkness_weight and not self.lce_cfg:
+            raise ValueError("distill.darkness_weight requires student.lce to be set")
 
         self.teacher_cfg = {}
         if isinstance(teacher_raw, dict):
@@ -227,6 +234,13 @@ class DetectionTrainer(BaseTrainer):
                             self.loss *= self.world_size
                         self.tloss = loss_vec if self.tloss is None else (self.tloss * i + loss_vec) / (i + 1)
 
+                        if self.lce_cfg and self.lce_loss_weight:
+                            # Ultralytics detection loss is summed over the batch: scale the per-pixel mean alike
+                            illumination = find_lce(unwrap_model(self.model)).illumination
+                            self.loss = self.loss + self.lce_loss_weight * batch["img"].shape[0] * darkness_loss(
+                                illumination, batch["img"]
+                            )
+
                         if distill_trainer is not None:
                             with torch.no_grad():
                                 teacher_input = batch["img"]
@@ -240,7 +254,11 @@ class DetectionTrainer(BaseTrainer):
                                     )
                                 self.teacher(teacher_input)
 
-                            d_loss = distill_trainer.get_loss() * self.kd_loss_weight
+                            darkness = None
+                            if self.kd_darkness_weight:
+                                # detached: the KD weight must not train the LCE (it would push L → 1)
+                                darkness = 1.0 - find_lce(unwrap_model(self.model)).illumination.detach()
+                            d_loss = distill_trainer.get_loss(darkness=darkness) * self.kd_loss_weight
                             self.loss = self.loss + d_loss
 
                     self.scaler.scale(self.loss).backward()
@@ -424,8 +442,17 @@ class DetectionTrainer(BaseTrainer):
 
     def get_model(self, cfg=None, weights=None, verbose=True):
         model = DetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        # Wrapped layers rename params (model.{i}.* → model.{i}.layer.*): attach the LCE before loading
+        # weights that already contain it (resume), after loading plain YOLO weights.
+        weights_have_lce = weights is not None and find_lce(weights) is not None
+        if self.lce_cfg and weights_have_lce:
+            attach_lce(model, **self.lce_cfg)
         if weights:
             model.load(weights)
+        if self.lce_cfg and not weights_have_lce:
+            attach_lce(model, **self.lce_cfg)
+            if verbose and RANK == -1:
+                LOGGER.info(f"{colorstr('LCE:')} attached to student, modulating layers {self.lce_cfg['layers']}")
         return model
 
     def get_validator(self):

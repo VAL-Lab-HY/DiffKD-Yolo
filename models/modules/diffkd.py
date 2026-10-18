@@ -176,7 +176,8 @@ class DiffKD(nn.Module):
             nn.BatchNorm2d(teacher_channels),
         )
 
-    def forward(self, student_feat: torch.Tensor, teacher_feat: torch.Tensor):
+    def forward(self, student_feat: torch.Tensor, teacher_feat: torch.Tensor, weight: torch.Tensor = None):
+        """``weight``: optional (B, 1, H, W) spatial weight of the feature-matching MSE (e.g. darkness map)."""
         # 1. Align student channels
         student_feat = self.trans(student_feat)
 
@@ -202,7 +203,11 @@ class DiffKD(nn.Module):
 
         # 4. Train diffusion model
         ddim_loss = self.ddim_loss(teacher_feat)
-        kd_loss = F.mse_loss(refined_feat, teacher_feat) + ddim_loss
+        if weight is None:
+            mse = F.mse_loss(refined_feat, teacher_feat)
+        else:
+            mse = (weight * (refined_feat - teacher_feat).pow(2)).mean()
+        kd_loss = mse + ddim_loss
 
         return refined_feat, teacher_feat, kd_loss, ae_loss
 

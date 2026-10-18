@@ -63,7 +63,13 @@ If you are using CUDA, install the PyTorch build that matches your GPU and drive
 ## Installation
 
 ```bash
-pip install ultralytics torch torchvision numpy pyyaml einops
+git clone https://github.com/VAL-Lab-HY/DiffKD-Yolo.git
+cd DiffKD-Yolo
+conda create -n diffkd python=3.10 -y && conda activate diffkd
+
+# PyTorch matching your CUDA version (example: CUDA 12.1)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
 ```
 
 Download the Retinexformer LOL-v2-real checkpoint from the [official repo](https://github.com/caiyuanhao1998/Retinexformer) and place it at `pretrained/LOL_v2_real.pth`.

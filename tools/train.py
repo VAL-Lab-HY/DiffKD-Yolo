@@ -28,6 +28,7 @@ def build_overrides(cfg) -> dict:
     """Config dict → overrides for DetectionTrainer."""
     return {
         "model": cfg["student"]["model"],
+        "lce": cfg["student"].get("lce"),
         "teacher": cfg["teacher"],
         "distill": cfg.get("distill", {}),
         **cfg.get("train", {}),

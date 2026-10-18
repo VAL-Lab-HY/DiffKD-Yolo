@@ -1,8 +1,16 @@
 # Retinexformer (LOL-v2-real) teacher at 320x320 → YOLOv10s student (imgsz 640), DiffKD on P2 / P3 / P5.
 # At 320 the teacher maps match P2 / P3 exactly (no feature resizing); P5 is a 4x antialiased downsample.
+# The student carries a Light Condition Encoder (LCE) whose darkness map modulates P2 / P3 / P5 and
+# weights the KD loss.
 
 student:
   model: yolov10s.pt
+  lce:                       # Light Condition Encoder in the student; remove (or null) to disable
+    layers: [2, 4, 8]        # outputs of model.{i} are FiLM-modulated by darkness D = 1 - L
+    hidden_dim: 32           # LCE width
+    modulation_dim: 16       # FiLM hidden width
+    downsample: 4            # LCE runs on the image avg-pooled by this factor (P2 has stride 4)
+    loss_weight: 1.0         # Salience-DETR loss_darkness: L1(1 - L, 1 - luminance)
 
 teacher:
   type: retinexformer                       # key in models/teachers/__init__.py:TEACHERS
@@ -17,18 +25,20 @@ teacher:
 
 distill:
   loss_weight: 0.1
+  darkness_weight: true      # weight the KD loss by the (detached) LCE darkness map; requires student.lce
   # teacher_channels / student_channels are optional: omitted → inferred from the hooked module.
+  # With student.lce, model.{i} is the LCE-modulated output of layer i.
   layers:
     - teacher: body.0.denoiser.decoder_layers.0.2   # 80 ch, 160x160
-      student: model.2.cv2.bn                       # P2, 160x160
+      student: model.2                              # P2, 160x160
       teacher_channels: 80
       weight: 1.0
     - teacher: body.0.denoiser.bottleneck           # 160 ch, 80x80
-      student: model.4.cv2.bn                       # P3, 80x80
+      student: model.4                              # P3, 80x80
       teacher_channels: 160
       weight: 1.25
     - teacher: body.0.denoiser.bottleneck           # 160 ch, 80x80 → 20x20
-      student: model.8.cv2.bn                       # P5, 20x20
+      student: model.8                              # P5, 20x20
       teacher_channels: 160
       weight: 1.5
 
@@ -39,4 +49,4 @@ train:
   batch: 16
   imgsz: 640
   project: experiments/runs
-  name: retinexformer_yolov10s_320
+  name: retinexformer_yolov10s_320_lce

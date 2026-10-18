@@ -39,7 +39,8 @@ class FeatureLoss(nn.Module):
             ]
         )
 
-    def forward(self, y_s, y_t):
+    def forward(self, y_s, y_t, darkness=None):
+        """``darkness``: optional (B, 1, H, W) map in [0, 1]; darker regions get a larger KD weight."""
         if len(y_s) != len(y_t):
             y_t = y_t[-len(y_s):]
 
@@ -50,7 +51,12 @@ class FeatureLoss(nn.Module):
                 # antialias avoids aliasing when the teacher map is downsampled (e.g. 4x for P5)
                 t = F.interpolate(t, size=s.shape[2:], mode="bilinear", align_corners=False, antialias=True)
 
-            _, _, kd_loss, ae_loss = self.diffkd[i](s, t.detach())
+            weight = None
+            if darkness is not None:
+                weight = F.adaptive_avg_pool2d(darkness.float(), s.shape[2:])
+                weight = weight / (weight.mean() + 1e-6)  # mean weight 1 keeps the KD loss scale
+
+            _, _, kd_loss, ae_loss = self.diffkd[i](s, t.detach(), weight=weight)
 
             loss = self.kd_weights[i] * kd_loss
             if ae_loss is not None:
@@ -140,6 +146,9 @@ class DistillationTrainer:
         _collect(self.student, self.student_modules, self.channels_s, "STUDENT")
 
     def _infer_out_channels(self, module):
+        # Ultralytics C2f-like blocks: output = cv2 (the first Conv2d found below would be cv1)
+        if hasattr(module, "cv2") and hasattr(module.cv2, "conv"):
+            return module.cv2.conv.out_channels
         if hasattr(module, "out_channels"):
             return module.out_channels
         if hasattr(module, "num_features"):
@@ -154,7 +163,7 @@ class DistillationTrainer:
                 return m.num_features
         return None
 
-    def get_loss(self):
+    def get_loss(self, darkness=None):
         n = len(self.student_modules)
         if len(self.teacher_outputs) != n or len(self.student_outputs) != n:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
@@ -162,6 +171,7 @@ class DistillationTrainer:
         feat_loss = self.loss_fn(
             y_s=[self.student_outputs[i] for i in range(n)],
             y_t=[self.teacher_outputs[i] for i in range(n)],
+            darkness=darkness,
         )
         self.teacher_outputs.clear()
         self.student_outputs.clear()

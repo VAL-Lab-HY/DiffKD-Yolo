@@ -8,11 +8,24 @@ import torch.nn.functional as F
 from torch import nn
 
 from models.modules.diffkd import DiffKD
+from models.modules.feature_kd import FeatureKD
 from ultralytics.utils import LOGGER
 
 
+def build_kd_module(method, student_channels, teacher_channels):
+    if method == "diffkd":
+        return DiffKD(
+            student_channels=student_channels,
+            teacher_channels=teacher_channels,
+            use_ae=(teacher_channels > student_channels),
+        )
+    if method == "feature":
+        return FeatureKD(student_channels=student_channels, teacher_channels=teacher_channels)
+    raise ValueError(f"Unknown distill.method '{method}', expected 'diffkd' or 'feature'")
+
+
 class FeatureLoss(nn.Module):
-    def __init__(self, channels_s, channels_t, device=None, kd_weight=None):
+    def __init__(self, channels_s, channels_t, device=None, kd_weight=None, method="diffkd"):
         super().__init__()
 
         if device is None:
@@ -28,15 +41,8 @@ class FeatureLoss(nn.Module):
         else:
             self.kd_weights = [kd_weight] * n
 
-        self.diffkd = nn.ModuleList(
-            [
-                DiffKD(
-                    student_channels=s,
-                    teacher_channels=t,
-                    use_ae=(t > s),
-                ).to(self.device)
-                for s, t in zip(channels_s, channels_t)
-            ]
+        self.kd_modules = nn.ModuleList(
+            [build_kd_module(method, s, t).to(self.device) for s, t in zip(channels_s, channels_t)]
         )
 
     def forward(self, y_s, y_t, darkness=None):
@@ -56,7 +62,7 @@ class FeatureLoss(nn.Module):
                 weight = F.adaptive_avg_pool2d(darkness.float(), s.shape[2:])
                 weight = weight / (weight.mean() + 1e-6)  # mean weight 1 keeps the KD loss scale
 
-            _, _, kd_loss, ae_loss = self.diffkd[i](s, t.detach(), weight=weight)
+            _, _, kd_loss, ae_loss = self.kd_modules[i](s, t.detach(), weight=weight)
 
             loss = self.kd_weights[i] * kd_loss
             if ae_loss is not None:
@@ -86,6 +92,7 @@ class DistillationTrainer:
         teacher_channels=None,
         student_channels=None,
         layer_weights=None,
+        method="diffkd",
     ):
         self.layers = layers or self.DEFAULT_LAYERS
         self.student = student
@@ -113,6 +120,7 @@ class DistillationTrainer:
             channels_t=self.channels_t,
             kd_weight=self.layer_weights if self.layer_weights is not None else 1.0,
             device=self.device,
+            method=method,
         ).to(self.device)
 
     def _find_layers(self):

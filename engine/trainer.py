@@ -39,6 +39,7 @@ class DetectionTrainer(BaseTrainer):
         # teacher: config dict (see configs/distill/*.yaml), checkpoint path or nn.Module
         teacher_raw = overrides.pop("teacher", None)
         distill_cfg = overrides.pop("distill", None) or {}
+        self.kd_method = distill_cfg.get("method", "diffkd")  # "diffkd" or "feature" (FitNets-style adapter + MSE)
         self.kd_loss_weight = distill_cfg.get("loss_weight", 0.1)
         self.kd_layers = distill_cfg.get("layers") or []
         self.kd_darkness_weight = distill_cfg.get("darkness_weight", False)
@@ -151,6 +152,7 @@ class DetectionTrainer(BaseTrainer):
                 teacher_channels=[layer.get("teacher_channels") for layer in self.kd_layers] or None,
                 student_channels=[layer.get("student_channels") for layer in self.kd_layers] or None,
                 layer_weights=[layer.get("weight", 1.0) for layer in self.kd_layers] or None,
+                method=self.kd_method,
             )
             self._add_kd_param_group(distill_trainer)
 
@@ -374,8 +376,8 @@ class DetectionTrainer(BaseTrainer):
         self.run_callbacks("teardown")
 
     def _add_kd_param_group(self, distill_trainer):
-        """Add DiffKD params to the optimizer and rebuild the scheduler so the KD group follows the LR schedule."""
-        kd_params = list(distill_trainer.loss_fn.diffkd.parameters())
+        """Add the KD module params (adapters / DiffKD) to the optimizer and rebuild the scheduler so the KD group follows the LR schedule."""
+        kd_params = list(distill_trainer.loss_fn.kd_modules.parameters())
         if not kd_params:
             return
         self.optimizer.add_param_group(
@@ -384,7 +386,7 @@ class DetectionTrainer(BaseTrainer):
                 "lr": self.args.lr0,
                 "initial_lr": self.args.lr0,
                 "weight_decay": self.args.weight_decay,
-                "param_group": "kd_diffkd",
+                "param_group": f"kd_{self.kd_method}",
             }
         )
         self._setup_scheduler()

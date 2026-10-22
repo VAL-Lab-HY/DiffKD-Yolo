@@ -1,0 +1,30 @@
+# YOLO26m teacher → YOLO26s student (imgsz 640), plain feature KD (FitNets-style 1x1 adapter + MSE,
+# models/modules/feature_kd.py) on P3 only, for small objects. Same architecture family, so the
+# teacher and student P3 maps share the 80x80 grid (no feature resizing); only channels differ.
+
+student:
+  model: yolo26s.pt
+
+teacher:
+  checkpoint: yolo26m.pt     # Ultralytics checkpoint; use YOLO26m fine-tuned on the same dataset
+                             # no input_size: the teacher sees the same 640 batch as the student
+
+distill:
+  method: feature            # "feature" (adapter + MSE) or "diffkd"
+  loss_weight: 0.1
+  # channels are inferred from the hooked C3k2 blocks (teacher m / student s)
+  layers:
+    - teacher: model.4       # backbone P3 (C3k2, 512 ch), 80x80
+      student: model.4       # backbone P3 (C3k2, 256 ch), 80x80
+      weight: 1.0
+    - teacher: model.16      # neck P3 (C3k2, 256 ch), 80x80
+      student: model.16      # neck P3 (C3k2, 128 ch), 80x80 → input of the small-object Detect branch
+      weight: 1.0
+
+train:
+  data: data/coco.yaml
+  epochs: 50
+  batch: 16
+  imgsz: 640
+  project: experiments/runs
+  name: yolo26m_yolo26s_p3_feature

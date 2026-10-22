@@ -33,6 +33,7 @@ DiffKD-Yolo/
 ├── models/
 │   ├── modules/
 │   │   ├── diffkd.py                     # DiffKD module
+│   │   ├── feature_kd.py                 # Plain feature KD (adapter + MSE)
 │   │   └── lce.py                        # Light Condition Encoder (from Salience-DETR)
 │   └── teachers/
 │       ├── __init__.py                   # Teacher registry: build_teacher(type, **args)
@@ -111,6 +112,7 @@ The resolved config is saved to `<save_dir>/config.yaml` for reproducibility.
 | `teacher.checkpoint` | Teacher weights (BasicSR `params`, `state_dict`, raw state dict, or Ultralytics checkpoint) |
 | `teacher.input_size` | Teacher input is resized to `(S, S)`; omit to feed the student-sized batch |
 | `teacher.args` | Constructor arguments of the teacher |
+| `distill.method` | `diffkd` (default) or `feature` (FitNets-style 1x1 adapter + MSE, `models/modules/feature_kd.py`) |
 | `distill.loss_weight` | Global weight of the KD loss |
 | `distill.layers` | List of `{teacher, student, teacher_channels?, student_channels?, weight}` hook pairs |
 | `train` | Passed verbatim to Ultralytics (`data`, `epochs`, `batch`, `imgsz`, `project`, `name`, ...) |

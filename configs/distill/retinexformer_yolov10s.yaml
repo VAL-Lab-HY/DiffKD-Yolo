@@ -6,7 +6,7 @@
 student:
   model: yolov10s.pt
   lce:                       # Light Condition Encoder in the student; remove (or null) to disable
-    layers: [2, 4, 8]        # outputs of model.{i} are FiLM-modulated by darkness D = 1 - L
+    layers: [2, 4, 6]        # outputs of model.{i} are FiLM-modulated by darkness D = 1 - L
     hidden_dim: 32           # LCE width
     modulation_dim: 16       # FiLM hidden width
     downsample: 4            # LCE runs on the image avg-pooled by this factor (P2 has stride 4)
@@ -38,13 +38,13 @@ distill:
       teacher_channels: 160
       weight: 1.25
     - teacher: body.0.denoiser.bottleneck           # 160 ch, 80x80 → 20x20
-      student: model.8                              # P5, 20x20
+      student: model.6                              # P5, 20x20
       teacher_channels: 160
       weight: 1.5
 
 # Passed verbatim to Ultralytics as training overrides.
 train:
-  data: data/exdark/data.yaml
+  data: dataset.yaml
   epochs: 50
   batch: 16
   imgsz: 640

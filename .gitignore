@@ -8,3 +8,9 @@ pretrained/*
 # Training runs
 experiments/runs/
 
+# Local ExDark originals and generated YOLO dataset
+ExDark/
+ExDark_Annno/
+data/exdark/
+
+.venv

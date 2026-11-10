@@ -9,24 +9,34 @@ from torch import nn
 
 from models.modules.diffkd import DiffKD
 from models.modules.feature_kd import FeatureKD
+from models.modules.fgd import FGD
 from ultralytics.utils import LOGGER
 
 
-def build_kd_module(method, student_channels, teacher_channels):
+KD_METHODS = ("diffkd", "feature", "fgd")
+
+
+def build_kd_module(method, student_channels, teacher_channels, **kwargs):
+    """``kwargs``: method-specific hyper-parameters (``distill.args`` in the config)."""
     if method == "diffkd":
         return DiffKD(
             student_channels=student_channels,
             teacher_channels=teacher_channels,
             use_ae=(teacher_channels > student_channels),
+            **kwargs,
         )
     if method == "feature":
-        return FeatureKD(student_channels=student_channels, teacher_channels=teacher_channels)
-    raise ValueError(f"Unknown distill.method '{method}', expected 'diffkd' or 'feature'")
+        return FeatureKD(student_channels=student_channels, teacher_channels=teacher_channels, **kwargs)
+    if method == "fgd":
+        return FGD(student_channels=student_channels, teacher_channels=teacher_channels, **kwargs)
+    raise ValueError(f"Unknown distill.method '{method}', expected one of {KD_METHODS}")
 
 
 class FeatureLoss(nn.Module):
-    def __init__(self, channels_s, channels_t, device=None, kd_weight=None, method="diffkd"):
+    def __init__(self, channels_s, channels_t, device=None, kd_weight=None, method="diffkd", kd_args=None):
         super().__init__()
+        # FGD separates foreground / background with the GT boxes
+        self.needs_targets = method == "fgd"
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -42,11 +52,12 @@ class FeatureLoss(nn.Module):
             self.kd_weights = [kd_weight] * n
 
         self.kd_modules = nn.ModuleList(
-            [build_kd_module(method, s, t).to(self.device) for s, t in zip(channels_s, channels_t)]
+            [build_kd_module(method, s, t, **(kd_args or {})).to(self.device) for s, t in zip(channels_s, channels_t)]
         )
 
-    def forward(self, y_s, y_t, darkness=None):
-        """``darkness``: optional (B, 1, H, W) map in [0, 1]; darker regions get a larger KD weight."""
+    def forward(self, y_s, y_t, darkness=None, targets=None):
+        """``darkness``: optional (B, 1, H, W) map in [0, 1]; darker regions get a larger KD weight.
+        ``targets``: optional ``(boxes, batch_idx)`` GT, normalized ``xyxy`` (used by FGD)."""
         if len(y_s) != len(y_t):
             y_t = y_t[-len(y_s):]
 
@@ -62,7 +73,8 @@ class FeatureLoss(nn.Module):
                 weight = F.adaptive_avg_pool2d(darkness.float(), s.shape[2:])
                 weight = weight / (weight.mean() + 1e-6)  # mean weight 1 keeps the KD loss scale
 
-            _, _, kd_loss, ae_loss = self.kd_modules[i](s, t.detach(), weight=weight)
+            extra = {"targets": targets} if self.needs_targets else {}
+            _, _, kd_loss, ae_loss = self.kd_modules[i](s, t.detach(), weight=weight, **extra)
 
             loss = self.kd_weights[i] * kd_loss
             if ae_loss is not None:
@@ -78,8 +90,6 @@ class FeatureLoss(nn.Module):
 
 
 class DistillationTrainer:
-    DEFAULT_LAYERS = ["6"]
-
     def __init__(
         self,
         student,
@@ -93,6 +103,7 @@ class DistillationTrainer:
         student_channels=None,
         layer_weights=None,
         method="diffkd",
+        kd_args=None,
     ):
         self.layers = layers or self.DEFAULT_LAYERS
         self.student = student
@@ -121,6 +132,7 @@ class DistillationTrainer:
             kd_weight=self.layer_weights if self.layer_weights is not None else 1.0,
             device=self.device,
             method=method,
+            kd_args=kd_args,
         ).to(self.device)
 
     def _find_layers(self):
@@ -171,7 +183,7 @@ class DistillationTrainer:
                 return m.num_features
         return None
 
-    def get_loss(self, darkness=None):
+    def get_loss(self, darkness=None, targets=None):
         n = len(self.student_modules)
         if len(self.teacher_outputs) != n or len(self.student_outputs) != n:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
@@ -180,6 +192,7 @@ class DistillationTrainer:
             y_s=[self.student_outputs[i] for i in range(n)],
             y_t=[self.teacher_outputs[i] for i in range(n)],
             darkness=darkness,
+            targets=targets,
         )
         self.teacher_outputs.clear()
         self.student_outputs.clear()

@@ -1,0 +1,51 @@
+# YOLO26m teacher → YOLO26s student (imgsz 640), FGD (Focal and Global KD, CVPR 2022,
+# models/modules/fgd.py) on the three neck features feeding Detect (P3 / P4 / P5), the analogue of
+# the FPN levels distilled in the paper. Same family → same grids (80 / 40 / 20), only channels differ
+# (aligned by FGD's 1x1 conv on the student).
+
+student:
+  model: yolo26s.pt
+
+teacher:
+  checkpoint: yolo26m.pt     # Ultralytics checkpoint; use YOLO26m fine-tuned on the same dataset
+
+distill:
+  method: fgd
+  # FGD terms are already weighted by alpha / beta / gamma / lambda below; the trainer multiplies the
+  # per-image FGD loss by the batch size to match Ultralytics' batch-summed detection loss.
+  loss_weight: 1.0
+  args:                      # = FGD RetinaNet config (configs/distillers/fgd/fgd_retina_*); tune per dataset
+    temp: 0.5                # attention temperature
+    alpha_fgd: 0.001         # foreground feature loss
+    beta_fgd: 0.0005         # background feature loss
+    gamma_fgd: 0.0005        # spatial / channel attention loss
+    lambda_fgd: 0.000005     # global (GcBlock relation) loss
+  layers:
+    - teacher: model.16      # neck P3, 80x80
+      student: model.16
+      weight: 1.0
+    - teacher: model.19      # neck P4, 40x40
+      student: model.19
+      weight: 1.0
+    - teacher: model.22      # neck P5, 20x20
+      student: model.22
+      weight: 1.0
+    # Optional backbone pairs (not in the paper, which distills only FPN outputs); uncomment to add.
+    # Backbone features are less detection-specific, so start with a lower weight.
+    # - teacher: model.4     # backbone P3 (C3k2), 80x80
+    #   student: model.4
+    #   weight: 0.5
+    # - teacher: model.6     # backbone P4 (C3k2), 40x40
+    #   student: model.6
+    #   weight: 0.5
+    # - teacher: model.10    # backbone P5 (C2PSA), 20x20
+    #   student: model.10
+    #   weight: 0.5
+
+train:
+  data: data/coco.yaml
+  epochs: 50
+  batch: 16
+  imgsz: 640
+  project: experiments/runs
+  name: yolo26m_yolo26s_p345_fgd

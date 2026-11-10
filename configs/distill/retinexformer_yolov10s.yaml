@@ -44,7 +44,7 @@ distill:
 
 # Passed verbatim to Ultralytics as training overrides.
 train:
-  data: data/coco.yaml
+  data: data/exdark/data.yaml
   epochs: 50
   batch: 16
   imgsz: 640

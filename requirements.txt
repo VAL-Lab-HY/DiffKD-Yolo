@@ -9,4 +9,5 @@ ultralytics
 
 numpy
 pyyaml
+pillow              # ExDark image validation and YOLO conversion
 einops               # IRFormer teacher only

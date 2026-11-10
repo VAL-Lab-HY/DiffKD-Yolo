@@ -1,0 +1,28 @@
+# Neck features feeding the three YOLO26 Detect branches.
+student:
+  model: yolo26s.pt
+teacher:
+  checkpoint: yolo26m.pt
+distill:
+  method: feature
+  loss_weight: 0.1
+  layers:
+    - name: P3
+      teacher: model.16
+      student: model.16
+      weight: 1.0
+    - name: P4
+      teacher: model.19
+      student: model.19
+      weight: 1.0
+    - name: P5
+      teacher: model.22
+      student: model.22
+      weight: 1.0
+train:
+  data: data/coco.yaml
+  epochs: 50
+  batch: 16
+  imgsz: 640
+  project: experiments/runs
+  name: yolo26m_yolo26s_p345_feature

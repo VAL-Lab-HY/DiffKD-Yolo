@@ -22,6 +22,7 @@ from ultralytics.models import yolo
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, TQDM, colorstr
 from ultralytics.utils.patches import override_configs
+from ultralytics.utils.ops import xywh2xyxy
 from ultralytics.utils.plotting import plot_images, plot_labels
 from ultralytics.utils.torch_utils import autocast, torch_distributed_zero_first, unwrap_model
 
@@ -39,7 +40,9 @@ class DetectionTrainer(BaseTrainer):
         # teacher: config dict (see configs/distill/*.yaml), checkpoint path or nn.Module
         teacher_raw = overrides.pop("teacher", None)
         distill_cfg = overrides.pop("distill", None) or {}
-        self.kd_method = distill_cfg.get("method", "diffkd")  # "diffkd" or "feature" (FitNets-style adapter + MSE)
+        # "diffkd", "feature" (FitNets-style adapter + MSE) or "fgd" (Focal and Global KD, models/modules/fgd.py)
+        self.kd_method = distill_cfg.get("method", "diffkd")
+        self.kd_args = distill_cfg.get("args") or {}  # method-specific hyper-parameters (e.g. FGD alpha/beta/...)
         self.kd_loss_weight = distill_cfg.get("loss_weight", 0.1)
         self.kd_layers = distill_cfg.get("layers") or []
         self.kd_darkness_weight = distill_cfg.get("darkness_weight", False)
@@ -153,6 +156,7 @@ class DetectionTrainer(BaseTrainer):
                 student_channels=[layer.get("student_channels") for layer in self.kd_layers] or None,
                 layer_weights=[layer.get("weight", 1.0) for layer in self.kd_layers] or None,
                 method=self.kd_method,
+                kd_args=self.kd_args,
             )
             self._add_kd_param_group(distill_trainer)
 
@@ -260,7 +264,14 @@ class DetectionTrainer(BaseTrainer):
                             if self.kd_darkness_weight:
                                 # detached: the KD weight must not train the LCE (it would push L → 1)
                                 darkness = 1.0 - find_lce(unwrap_model(self.model)).illumination.detach()
-                            d_loss = distill_trainer.get_loss(darkness=darkness) * self.kd_loss_weight
+                            targets = None
+                            if self.kd_method == "fgd":
+                                targets = (xywh2xyxy(batch["bboxes"]), batch["batch_idx"])
+                            d_loss = distill_trainer.get_loss(darkness=darkness, targets=targets) * self.kd_loss_weight
+                            if self.kd_method == "fgd":
+                                # FGD losses are per-image means (as in mmdet); Ultralytics sums the detection
+                                # loss over the batch, so scale alike to keep the paper's loss balance
+                                d_loss = d_loss * batch["img"].shape[0]
                             self.loss = self.loss + d_loss
 
                     self.scaler.scale(self.loss).backward()
@@ -345,6 +356,8 @@ class DetectionTrainer(BaseTrainer):
                     self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
                 if self.args.save or final_epoch:
                     self.save_model()
+                    if distill_trainer is not None:
+                        self._save_transfer_checkpoint(distill_trainer)
                     self.run_callbacks("on_model_save")
 
             t = time.time()
@@ -374,6 +387,32 @@ class DetectionTrainer(BaseTrainer):
             self.run_callbacks("on_train_end")
         self._clear_memory()
         self.run_callbacks("teardown")
+
+    def _save_transfer_checkpoint(self, distill_trainer):
+        """Keep the exact student and learned transfer modules together for visualization."""
+        student_names = {id(module): name for name, module in unwrap_model(self.model).named_modules()}
+        teacher_names = {id(module): name for name, module in self.teacher.named_modules()}
+        checkpoint = {
+            "model": deepcopy(unwrap_model(self.model)).cpu().float(),
+            "kd_modules": {
+                key: value.detach().cpu()
+                for key, value in distill_trainer.loss_fn.kd_modules.state_dict().items()
+            },
+            "method": self.kd_method,
+            "kd_args": self.kd_args,
+            "layers": self.kd_layers or [
+                {"teacher": teacher_names[id(teacher)], "student": student_names[id(student)]}
+                for teacher, student in zip(distill_trainer.teacher_modules, distill_trainer.student_modules)
+            ],
+            "teacher_cfg": self.teacher_cfg,
+            "teacher_path": self.teacher_path,
+            "teacher_input_size": self.teacher_input_size,
+            "imgsz": self.args.imgsz,
+            "epoch": self.epoch,
+        }
+        torch.save(checkpoint, self.wdir / "transfer_last.pt")
+        if self.best_fitness == self.fitness:
+            torch.save(checkpoint, self.wdir / "transfer_best.pt")
 
     def _add_kd_param_group(self, distill_trainer):
         """Add the KD module params (adapters / DiffKD) to the optimizer and rebuild the scheduler so the KD group follows the LR schedule."""

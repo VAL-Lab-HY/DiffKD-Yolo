@@ -159,6 +159,16 @@ class DetectionTrainer(BaseTrainer):
                 kd_args=self.kd_args,
             )
             self._add_kd_param_group(distill_trainer)
+            if RANK in {-1, 0}:
+                # student + KD modules (one per hooked layer), keyed by student layer name
+                kd_dict = nn.ModuleDict(
+                    {
+                        layer["student"].replace(".", "_"): m
+                        for layer, m in zip(self.kd_layers, distill_trainer.loss_fn.kd_modules)
+                    }
+                )
+                LOGGER.info(f"{colorstr('Student:')}\n{unwrap_model(self.model)}")
+                LOGGER.info(f"{colorstr('KD modules (_diff):')}\n{kd_dict}")
 
         epoch = self.start_epoch
         self.optimizer.zero_grad()

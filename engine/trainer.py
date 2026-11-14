@@ -427,19 +427,34 @@ class DetectionTrainer(BaseTrainer):
     def _add_kd_param_group(self, distill_trainer):
         """Add the KD module params (adapters / DiffKD) to the optimizer and rebuild the scheduler so the KD group follows the LR schedule."""
         kd_params = list(distill_trainer.loss_fn.kd_modules.parameters())
+        self.kd_params = kd_params  # clipped in optimizer_step (Ultralytics clips only self.model)
         if not kd_params:
             return
-        self.optimizer.add_param_group(
-            {
-                "params": kd_params,
-                "lr": self.args.lr0,
-                "initial_lr": self.args.lr0,
-                "weight_decay": self.args.weight_decay,
-                "param_group": f"kd_{self.kd_method}",
-            }
-        )
+        group = {
+            "params": kd_params,
+            "lr": self.args.lr0,
+            "initial_lr": self.args.lr0,
+            "weight_decay": self.args.weight_decay,
+            "param_group": f"kd_{self.kd_method}",
+        }
+        if "momentum" in self.optimizer.defaults:
+            # SGD / MuSGD: without this the KD group falls back to the optimizer default momentum=0
+            group.update(momentum=self.args.momentum, nesterov=True)
+        self.optimizer.add_param_group(group)
         self._setup_scheduler()
         self.scheduler.last_epoch = self.start_epoch - 1
+
+    def optimizer_step(self):
+        """Ultralytics' step, but the KD module params are gradient-clipped too (they are not in self.model)."""
+        self.scaler.unscale_(self.optimizer)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+        if getattr(self, "kd_params", None):
+            torch.nn.utils.clip_grad_norm_(self.kd_params, max_norm=10.0)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.optimizer.zero_grad()
+        if self.ema:
+            self.ema.update(self.model)
 
     def build_dataset(self, img_path, mode="train", batch=None):
         gs = max(int(unwrap_model(self.model).stride.max()), 32)

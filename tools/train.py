@@ -55,5 +55,8 @@ if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        stream=sys.stdout,
+        force=True,  # override handlers added by imported libs so logs always show
     )
+    sys.stdout.reconfigure(line_buffering=True)  # flush each line (nohup / pipes / tee)
     main()

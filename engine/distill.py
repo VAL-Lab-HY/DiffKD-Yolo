@@ -74,7 +74,10 @@ class FeatureLoss(nn.Module):
                 weight = weight / (weight.mean() + 1e-6)  # mean weight 1 keeps the KD loss scale
 
             extra = {"targets": targets} if self.needs_targets else {}
-            _, _, kd_loss, ae_loss = self.kd_modules[i](s, t.detach(), weight=weight, **extra)
+            # fp32 outside AMP: the KD convs (FGD GcBlock / attention masks, adapters) are unbounded by BN and
+            # their weights can grow large enough that fp16 activations overflow → inf → NaN every step
+            with torch.autocast(device_type=s.device.type, enabled=False):
+                _, _, kd_loss, ae_loss = self.kd_modules[i](s.float(), t.detach().float(), weight=weight, **extra)
 
             loss = self.kd_weights[i] * kd_loss
             if ae_loss is not None:

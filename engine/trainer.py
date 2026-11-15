@@ -27,7 +27,7 @@ from ultralytics.utils.plotting import plot_images, plot_labels
 from ultralytics.utils.torch_utils import autocast, torch_distributed_zero_first, unwrap_model
 
 from engine.distill import DistillationTrainer
-from models.modules.lce import attach_lce, darkness_loss, find_lce
+from models.modules.lce import attach_lce, darkness_loss, find_lce, fuse_light_conditions
 from models.teachers import build_teacher
 
 
@@ -46,11 +46,24 @@ class DetectionTrainer(BaseTrainer):
         self.kd_loss_weight = distill_cfg.get("loss_weight", 0.1)
         self.kd_layers = distill_cfg.get("layers") or []
         self.kd_darkness_weight = distill_cfg.get("darkness_weight", False)
+        self.lce_guidance = distill_cfg.get("lce_guidance", True)
+        self.lce_fusion_mode = distill_cfg.get("lce_fusion_mode", "residual")
         # Light Condition Encoder inside the student (see models/modules/lce.py:attach_lce)
         self.lce_cfg = dict(overrides.pop("lce", None) or {})
         self.lce_loss_weight = self.lce_cfg.pop("loss_weight", 1.0)
         if self.kd_darkness_weight and not self.lce_cfg:
             raise ValueError("distill.darkness_weight requires student.lce to be set")
+
+        # Auto-configure cond_channels for diffkd if lce_guidance is enabled
+        if self.kd_method == "diffkd" and self.lce_guidance and self.lce_cfg:
+            self.kd_args = dict(self.kd_args)
+            if "cond_channels" not in self.kd_args:
+                if self.lce_fusion_mode == "concat":
+                    self.kd_args["cond_channels"] = 2
+                elif self.lce_fusion_mode == "both":
+                    self.kd_args["cond_channels"] = 3
+                else:
+                    self.kd_args["cond_channels"] = 1
 
         self.teacher_cfg = {}
         if isinstance(teacher_raw, dict):
@@ -268,16 +281,41 @@ class DetectionTrainer(BaseTrainer):
                                         align_corners=False,
                                         antialias=True,
                                     )
-                                self.teacher(teacher_input)
+                                enhanced_img = self.teacher(teacher_input)
+                                if isinstance(enhanced_img, (tuple, list)):
+                                    enhanced_img = enhanced_img[0]
+                                elif isinstance(enhanced_img, dict):
+                                    enhanced_img = next(iter(enhanced_img.values()))
 
+                            cond = None
                             darkness = None
-                            if self.kd_darkness_weight:
-                                # detached: the KD weight must not train the LCE (it would push L → 1)
-                                darkness = 1.0 - find_lce(unwrap_model(self.model)).illumination.detach()
+                            lce = find_lce(unwrap_model(self.model))
+                            if lce is not None and self.lce_guidance and enhanced_img is not None:
+                                L_low = lce.illumination.detach() if lce.illumination is not None else None
+                                with torch.no_grad():
+                                    stem = getattr(unwrap_model(self.model).model[0], "downsample", 1)
+                                    downsample = stem if isinstance(stem, int) else 1
+                                    enh_for_lce = (
+                                        F.avg_pool2d(enhanced_img, downsample)
+                                        if downsample > 1 and min(enhanced_img.shape[-2:]) >= downsample
+                                        else enhanced_img
+                                    )
+                                    L_enh = lce(enh_for_lce).detach()
+
+                                if L_low is not None and L_enh is not None:
+                                    cond, delta_weight = fuse_light_conditions(L_low, L_enh, mode=self.lce_fusion_mode)
+                                    if self.kd_darkness_weight:
+                                        darkness = delta_weight
+                            elif self.kd_darkness_weight and lce is not None and lce.illumination is not None:
+                                darkness = 1.0 - lce.illumination.detach()
+
                             targets = None
                             if self.kd_method == "fgd":
                                 targets = (xywh2xyxy(batch["bboxes"]), batch["batch_idx"])
-                            d_loss = distill_trainer.get_loss(darkness=darkness, targets=targets) * self.kd_loss_weight
+                            d_loss = (
+                                distill_trainer.get_loss(darkness=darkness, targets=targets, cond=cond)
+                                * self.kd_loss_weight
+                            )
                             if self.kd_method == "fgd":
                                 # FGD losses are per-image means (as in mmdet); Ultralytics sums the detection
                                 # loss over the batch, so scale alike to keep the paper's loss balance

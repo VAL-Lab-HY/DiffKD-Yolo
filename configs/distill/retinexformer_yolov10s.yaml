@@ -25,7 +25,9 @@ teacher:
 
 distill:
   loss_weight: 0.1
-  darkness_weight: true      # weight the KD loss by the (detached) LCE darkness map; requires student.lce
+  darkness_weight: true      # weight the KD loss by the residual enhancement map Delta_L
+  lce_guidance: true         # feed LCE(I_low) ⨁ LCE(I_enh) as condition into KD-Diffusion
+  lce_fusion_mode: residual  # 'residual' (1 ch), 'concat' (2 ch), or 'diff' (1 ch)
   # teacher_channels / student_channels are optional: omitted → inferred from the hooked module.
   # With student.lce, model.{i} is the LCE-modulated output of layer i.
   layers:

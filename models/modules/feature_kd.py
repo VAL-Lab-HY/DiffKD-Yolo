@@ -20,7 +20,7 @@ class FeatureKD(nn.Module):
         # teacher per channel gives a target the BN-ended adapter can match
         self.normalize = normalize
 
-    def forward(self, student_feat: torch.Tensor, teacher_feat: torch.Tensor, weight: torch.Tensor = None):
+    def forward(self, student_feat: torch.Tensor, teacher_feat: torch.Tensor, weight: torch.Tensor = None, **kwargs):
         """``weight``: optional (B, 1, H, W) spatial weight of the MSE (e.g. darkness map)."""
         student_feat = self.adapter(student_feat)
         teacher_feat = teacher_feat.float()

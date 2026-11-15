@@ -74,7 +74,7 @@ class FGD(nn.Module):
             nn.init.zeros_(block[-1].weight)
             nn.init.zeros_(block[-1].bias)
 
-    def forward(self, student_feat, teacher_feat, weight=None, targets=None):
+    def forward(self, student_feat, teacher_feat, weight=None, targets=None, **kwargs):
         """
         Args:
             student_feat: (B, Cs, H, W) student feature.

@@ -27,9 +27,19 @@ class Bottleneck(nn.Module):
 
 
 class DiffusionModel(nn.Module):
-    def __init__(self, channels_in: int, kernel_size: int = 3):
+    def __init__(self, channels_in: int, kernel_size: int = 3, cond_channels: int = 0):
         super().__init__()
         self.time_embedding = nn.Embedding(1280, channels_in)
+        self.cond_channels = cond_channels
+        if cond_channels > 0:
+            self.cond_proj = nn.Sequential(
+                nn.Conv2d(cond_channels, channels_in, 1),
+                nn.GELU(),
+                nn.Conv2d(channels_in, channels_in, 1),
+            )
+            # Zero-init so training begins identical to unconditional diffusion
+            nn.init.constant_(self.cond_proj[-1].weight, 0)
+            nn.init.constant_(self.cond_proj[-1].bias, 0)
         self.net = nn.Sequential(
             Bottleneck(channels_in, channels_in),
             Bottleneck(channels_in, channels_in),
@@ -37,12 +47,16 @@ class DiffusionModel(nn.Module):
             nn.BatchNorm2d(channels_in),
         )
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor = None) -> torch.Tensor:
         if t.dtype != torch.long:
             t = t.long()
         if t.dim() == 0:
             t = t.unsqueeze(0).expand(x.shape[0])
         feat = x + self.time_embedding(t)[..., None, None]
+        if cond is not None and self.cond_channels > 0:
+            if cond.shape[2:] != feat.shape[2:]:
+                cond = F.interpolate(cond, size=feat.shape[2:], mode="bilinear", align_corners=False)
+            feat = feat + self.cond_proj(cond.to(dtype=feat.dtype, device=feat.device))
         return self.net(feat)
 
 
@@ -122,7 +136,7 @@ class DDIMPipeline:
         self.noise_adapter = noise_adapter
 
     def __call__(self, batch_size, device, dtype, shape, feat,
-                 num_inference_steps=5, proj=None):
+                 num_inference_steps=5, proj=None, cond=None):
         noise = torch.randn((batch_size, *shape), device=device, dtype=dtype)
 
         if self.noise_adapter is not None:
@@ -137,7 +151,7 @@ class DDIMPipeline:
 
         for i, t in enumerate(timesteps[half:]):
             t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
-            noise_pred = self.model(image, t_tensor)
+            noise_pred = self.model(image, t_tensor, cond=cond)
             idx = half + i
             t_prev = timesteps[idx + 1] if idx + 1 < len(timesteps) else -1
             image = self.scheduler.step(noise_pred, t, image, t_prev)
@@ -149,12 +163,15 @@ class DDIMPipeline:
 
 
 class DiffKD(nn.Module):
+    supports_cond = True
+
     def __init__(self, student_channels, teacher_channels, kernel_size=3,
                  inference_steps=5, num_train_timesteps=500,
-                 use_ae=False, ae_channels=None):
+                 use_ae=False, ae_channels=None, cond_channels=0):
         super().__init__()
         self.use_ae = use_ae
         self.diffusion_inference_steps = inference_steps
+        self.cond_channels = cond_channels
 
         if use_ae:
             if ae_channels is None:
@@ -163,7 +180,11 @@ class DiffKD(nn.Module):
             teacher_channels = ae_channels
 
         self.trans = nn.Conv2d(student_channels, teacher_channels, 1)
-        self.model = DiffusionModel(channels_in=teacher_channels, kernel_size=kernel_size)
+        self.model = DiffusionModel(
+            channels_in=teacher_channels,
+            kernel_size=kernel_size,
+            cond_channels=cond_channels,
+        )
         self.scheduler = DDIMScheduler(
             num_train_timesteps=num_train_timesteps,
             beta_start=1e-4,
@@ -176,8 +197,10 @@ class DiffKD(nn.Module):
             nn.BatchNorm2d(teacher_channels),
         )
 
-    def forward(self, student_feat: torch.Tensor, teacher_feat: torch.Tensor, weight: torch.Tensor = None):
-        """``weight``: optional (B, 1, H, W) spatial weight of the feature-matching MSE (e.g. darkness map)."""
+    def forward(self, student_feat: torch.Tensor, teacher_feat: torch.Tensor,
+                weight: torch.Tensor = None, cond: torch.Tensor = None, **kwargs):
+        """``weight``: optional (B, 1, H, W) spatial weight of the feature-matching MSE.
+        ``cond``: optional (B, C_cond, H, W) light condition tensor (e.g. from LCE ⨁)."""
         # 1. Align student channels
         student_feat = self.trans(student_feat)
 
@@ -198,11 +221,12 @@ class DiffKD(nn.Module):
             feat=student_feat,
             num_inference_steps=self.diffusion_inference_steps,
             proj=None,
+            cond=cond,
         )
         refined_feat = self.proj(refined_feat)
 
         # 4. Train diffusion model
-        ddim_loss = self.ddim_loss(teacher_feat)
+        ddim_loss = self.ddim_loss(teacher_feat, cond=cond)
         if weight is None:
             mse = F.mse_loss(refined_feat, teacher_feat)
         else:
@@ -211,10 +235,10 @@ class DiffKD(nn.Module):
 
         return refined_feat, teacher_feat, kd_loss, ae_loss
 
-    def ddim_loss(self, gt_feat: torch.Tensor) -> torch.Tensor:
+    def ddim_loss(self, gt_feat: torch.Tensor, cond: torch.Tensor = None) -> torch.Tensor:
         noise = torch.randn_like(gt_feat)
         bs = gt_feat.shape[0]
         timesteps = torch.randint(0, self.scheduler.num_train_timesteps, (bs,), device=gt_feat.device).long()
         noisy = self.scheduler.add_noise(gt_feat, noise, timesteps)
-        noise_pred = self.model(noisy, timesteps)
+        noise_pred = self.model(noisy, timesteps, cond=cond)
         return F.mse_loss(noise_pred, noise)

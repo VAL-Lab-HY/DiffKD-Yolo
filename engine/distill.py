@@ -19,10 +19,11 @@ KD_METHODS = ("diffkd", "feature", "fgd")
 def build_kd_module(method, student_channels, teacher_channels, **kwargs):
     """``kwargs``: method-specific hyper-parameters (``distill.args`` in the config)."""
     if method == "diffkd":
+        use_ae = kwargs.pop("use_ae", teacher_channels > student_channels)
         return DiffKD(
             student_channels=student_channels,
             teacher_channels=teacher_channels,
-            use_ae=(teacher_channels > student_channels),
+            use_ae=use_ae,
             **kwargs,
         )
     if method == "feature":
@@ -55,9 +56,10 @@ class FeatureLoss(nn.Module):
             [build_kd_module(method, s, t, **(kd_args or {})).to(self.device) for s, t in zip(channels_s, channels_t)]
         )
 
-    def forward(self, y_s, y_t, darkness=None, targets=None):
+    def forward(self, y_s, y_t, darkness=None, targets=None, cond=None):
         """``darkness``: optional (B, 1, H, W) map in [0, 1]; darker regions get a larger KD weight.
-        ``targets``: optional ``(boxes, batch_idx)`` GT, normalized ``xyxy`` (used by FGD)."""
+        ``targets``: optional ``(boxes, batch_idx)`` GT, normalized ``xyxy`` (used by FGD).
+        ``cond``: optional (B, C_cond, H, W) light condition tensor from LCE ⨁ fusion."""
         if len(y_s) != len(y_t):
             y_t = y_t[-len(y_s):]
 
@@ -73,7 +75,11 @@ class FeatureLoss(nn.Module):
                 weight = F.adaptive_avg_pool2d(darkness.float(), s.shape[2:])
                 weight = weight / (weight.mean() + 1e-6)  # mean weight 1 keeps the KD loss scale
 
-            extra = {"targets": targets} if self.needs_targets else {}
+            extra = {}
+            if self.needs_targets:
+                extra["targets"] = targets
+            if cond is not None:
+                extra["cond"] = cond
             # fp32 outside AMP: the KD convs (FGD GcBlock / attention masks, adapters) are unbounded by BN and
             # their weights can grow large enough that fp16 activations overflow → inf → NaN every step
             with torch.autocast(device_type=s.device.type, enabled=False):
@@ -186,7 +192,7 @@ class DistillationTrainer:
                 return m.num_features
         return None
 
-    def get_loss(self, darkness=None, targets=None):
+    def get_loss(self, darkness=None, targets=None, cond=None):
         n = len(self.student_modules)
         if len(self.teacher_outputs) != n or len(self.student_outputs) != n:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
@@ -196,6 +202,7 @@ class DistillationTrainer:
             y_t=[self.teacher_outputs[i] for i in range(n)],
             darkness=darkness,
             targets=targets,
+            cond=cond,
         )
         self.teacher_outputs.clear()
         self.student_outputs.clear()

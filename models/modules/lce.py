@@ -142,3 +142,43 @@ def find_lce(model):
         if isinstance(m, LightConditionEncoder):
             return m
     return None
+
+
+def fuse_light_conditions(l_low: torch.Tensor, l_enh: torch.Tensor, mode: str = "residual"):
+    """Fusion operator ⨁ between low-light illumination map L_low and enhanced illumination map L_enh.
+
+    Args:
+        l_low: (B, 1, H1, W1) illumination map of input low-light image in [0, 1].
+        l_enh: (B, 1, H2, W2) illumination map of enhanced image in [0, 1].
+        mode:
+            - 'residual' (default): delta_L = clamp(L_enh - L_low, min=0). Shape (B, 1, H, W).
+              Measures the illumination gained by the teacher's enhancement.
+            - 'concat': torch.cat([L_low, L_enh], dim=1). Shape (B, 2, H, W).
+            - 'diff': abs(L_enh - L_low). Shape (B, 1, H, W).
+            - 'both': torch.cat([L_low, L_enh, delta_L], dim=1). Shape (B, 3, H, W).
+
+    Returns:
+        cond: (B, C_cond, H, W) light condition tensor for KD-Diffusion.
+        weight: (B, 1, H, W) spatial weight tensor for feature distillation MSE loss.
+    """
+    l_enh = l_enh.to(dtype=l_low.dtype, device=l_low.device)
+    if l_enh.shape[2:] != l_low.shape[2:]:
+        l_enh = F.interpolate(l_enh, size=l_low.shape[2:], mode="bilinear", align_corners=False)
+
+    delta = torch.clamp(l_enh - l_low, min=0.0)
+
+    if mode == "residual":
+        cond = delta
+    elif mode == "concat":
+        cond = torch.cat([l_low, l_enh], dim=1)
+    elif mode == "diff":
+        cond = torch.abs(l_enh - l_low)
+    elif mode == "both":
+        cond = torch.cat([l_low, l_enh, delta], dim=1)
+    else:
+        raise ValueError(f"Unknown fusion mode: '{mode}'. Expected 'residual', 'concat', 'diff', or 'both'.")
+
+    # Spatial weight: regions where the teacher brought the largest illumination improvement
+    weight = delta
+    return cond, weight
+

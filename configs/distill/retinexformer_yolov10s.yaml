@@ -31,16 +31,16 @@ distill:
   # teacher_channels / student_channels are optional: omitted → inferred from the hooked module.
   # With student.lce, model.{i} is the LCE-modulated output of layer i.
   layers:
-    - teacher: body.0.denoiser.decoder_layers.0.2   # 80 ch, 160x160
-      student: model.2                              # P2, 160x160
-      teacher_channels: 80
+    - teacher: body.0.denoiser.encoder_layers.0.0   
+      student: model.4                             
+      teacher_channels: 40
       weight: 1.0
-    - teacher: body.0.denoiser.bottleneck           # 160 ch, 80x80
-      student: model.4                              # P3, 80x80
-      teacher_channels: 160
+    - teacher: body.0.denoiser.decoder_layers.0.2    
+      student: model.6                             
+      teacher_channels: 80
       weight: 1.25
     - teacher: body.0.denoiser.bottleneck           # 160 ch, 80x80 → 20x20
-      student: model.6                              # P5, 20x20
+      student: model.8                              # P5, 20x20
       teacher_channels: 160
       weight: 1.5
 
